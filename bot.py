@@ -1,18 +1,18 @@
 """
-╔══════════════════════════════════════════════════════════════════════╗
-║  👑 LUX STUDIO VIP v7 — Complete Designer App + Rewards              ║
-║  ──────────────────────────────────────────────────────────────────  ║
-║  • Auto API key generation (no more "key missing")                   ║
-║  • 21 image tools                                                    ║
-║  • Tasks page: daily check-in, share, invite, subscribe links        ║
-║  • Owner panel: manage users, tasks, links, password                 ║
-║  • PWA installable                                                    ║
-║  • DSS database integrated                                            ║
-╚══════════════════════════════════════════════════════════════════════╝
+╔══════════════════════════════════════════════════════════════════╗
+║  👑 LUX STUDIO VIP v8 — REAL & FOCUSED                           ║
+║  ─────────────────────────────────────────────────────────────── ║
+║  FIXES:                                                          ║
+║  • /ping never creates users (bot detection)                     ║
+║  • No auto-key on page load — only on user action                ║
+║  • Each user gets LUX-XXXX-XXXX token for charging               ║
+║  • Profile page with token + invite                              ║
+║  • Owner panel: search by token, charge credits                  ║
+╚══════════════════════════════════════════════════════════════════╝
 """
 
 import os, sys, io, time, secrets, hashlib, logging, asyncio, contextlib
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from typing import Optional
 from collections import defaultdict, Counter
 
@@ -28,7 +28,7 @@ import uvicorn
 # ═══════════════════════════════════════════════════════════════════
 DSS_BASE_URL = "https://kali-imvx.onrender.com"
 DSS_API_KEY  = "dss_SSiPIYB4EpWwVmfygQ1LTF2KymOjd-qxAQ4U3Q"
-OWNER_PASSWORD = "xeon"          # ← كلمة مرور المالك (صفحة /owner)
+OWNER_PASSWORD = "xeon"
 OWNER_SESSION_HOURS = 24
 FREE_CREDITS = 30
 MAX_FILE_MB = 15
@@ -36,17 +36,14 @@ MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 PORT = int(os.getenv("PORT", "8000"))
 RATE_WINDOW = 60
 RATE_LIMIT = 40
-APP_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/") or f"http://localhost:{PORT}"
 
-# Default tasks config (can be overridden via /owner panel)
 DEFAULT_TASKS = {
     "daily_checkin": {"reward": 3, "label": "زيارة يومية"},
     "share_app": {"reward": 5, "label": "مشاركة التطبيق"},
     "invite_friend": {"reward": 15, "label": "دعوة صديق"},
 }
 DEFAULT_LINKS = [
-    {"id": "t1", "title": "تابعنا على تيليجرام", "url": "https://t.me/telegram", "reward": 10, "icon": "✈️"},
-    {"id": "t2", "title": "قناتنا على واتساب", "url": "https://whatsapp.com", "reward": 10, "icon": "💬"},
+    {"id": "t1", "title": "قناة تيليجرام", "url": "https://t.me/telegram", "reward": 10, "icon": "✈️"},
 ]
 
 logging.basicConfig(
@@ -54,6 +51,45 @@ logging.basicConfig(
     stream=sys.stdout, force=True,
 )
 log = logging.getLogger("lux")
+
+# ═══════════════════════════════════════════════════════════════════
+#  🛡️ BOT DETECTION — الحل الجذري لمشكلة ping
+# ═══════════════════════════════════════════════════════════════════
+BROWSER_SIGS = ["mozilla", "chrome", "safari", "firefox", "edge", "opera"]
+BOT_SIGS = ["bot", "crawler", "spider", "uptime", "pingdom", "monitor", "cron",
+            "curl", "wget", "python-requests", "httpx", "okhttp", "go-http",
+            "render", "healthcheck", "health-check", "prerender", "headless",
+            "phantom", "selenium", "puppeteer", "playwright", "googlebot",
+            "bingbot", "yandex", "baidu", "duckduckbot", "ahrefs", "semrush"]
+
+
+def is_human_request(request: Request) -> tuple:
+    """
+    Returns (is_human, reason).
+    Ensures /api/keys/new only creates users for real browsers.
+    """
+    ua = (request.headers.get("user-agent", "") or "").lower().strip()
+    accept = (request.headers.get("accept", "") or "").lower()
+    lang = (request.headers.get("accept-language", "") or "").lower()
+
+    if not ua or len(ua) < 10:
+        return False, f"empty UA ({ua!r})"
+
+    # Must have browser signature
+    if not any(sig in ua for sig in BROWSER_SIGS):
+        return False, f"not a browser ({ua[:50]})"
+
+    # Reject bot keywords
+    for sig in BOT_SIGS:
+        if sig in ua:
+            return False, f"bot signature '{sig}'"
+
+    # Browsers always accept HTML
+    if "text/html" not in accept and not accept.startswith("*/*"):
+        return False, f"Accept header: {accept[:40]}"
+
+    return True, "ok"
+
 
 # ═══════════════════════════════════════════════════════════════════
 #  REMBG LAZY LOADER
@@ -72,8 +108,9 @@ def _load_rembg_sync():
         from rembg import remove as rr, new_session
         _rembg_remove = rr
         try:
-            new_session(REMBG_MODEL); log.info(f"✅ '{REMBG_MODEL}' ready")
-        except Exception as e: log.warning(f"⚠️ preload: {e}")
+            new_session(REMBG_MODEL)
+            log.info(f"✅ '{REMBG_MODEL}' ready")
+        except Exception as e: log.warning(f"⚠️ {e}")
     except Exception as e: log.error(f"❌ rembg: {e}")
     finally:
         _rembg_ready = True
@@ -96,13 +133,9 @@ class DSSError(Exception): pass
 class DSS:
     def __init__(self):
         self.base = DSS_BASE_URL.rstrip("/")
-        self.headers = {
-            "X-API-Key": DSS_API_KEY,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
+        self.headers = {"X-API-Key": DSS_API_KEY, "Content-Type": "application/json", "Accept": "application/json"}
 
-    async def _req(self, method: str, path: str, retries: int = 2, **kw):
+    async def _req(self, method, path, retries=2, **kw):
         url = f"{self.base}{path}"; last = None
         for attempt in range(retries + 1):
             try:
@@ -118,8 +151,8 @@ class DSS:
             if attempt < retries: await asyncio.sleep(0.6)
         raise last or DSSError("unknown")
 
-    async def list(self, collection: str) -> list:
-        try: res = await self._req("GET", f"/api/db/{collection}")
+    async def list(self, col):
+        try: res = await self._req("GET", f"/api/db/{col}")
         except DSSError as e:
             if "404" in str(e): return []
             raise
@@ -130,27 +163,27 @@ class DSS:
             if "id" in res or "_id" in res: return [res]
         return []
 
-    async def create(self, collection: str, data: dict) -> dict:
-        res = await self._req("POST", f"/api/db/{collection}", json=data)
+    async def create(self, col, data):
+        res = await self._req("POST", f"/api/db/{col}", json=data)
         if isinstance(res, dict):
             for key in ("id","_id","uuid","key","ID"):
                 if key in res: return {**data, **res}
             if isinstance(res.get("data"), dict): return {**data, **res["data"]}
         return {**data, "_raw": res}
 
-    async def update(self, collection: str, doc_id, data: dict) -> dict:
+    async def update(self, col, doc_id, data):
         for method in ("PATCH", "PUT"):
-            try: return await self._req(method, f"/api/db/{collection}/{doc_id}", json=data)
+            try: return await self._req(method, f"/api/db/{col}/{doc_id}", json=data)
             except DSSError: continue
-        try: return await self._req("POST", f"/api/db/{collection}", json={**data, "id": doc_id})
+        try: return await self._req("POST", f"/api/db/{col}", json={**data, "id": doc_id})
         except DSSError as e: log.warning(f"update fallback: {e}"); return {}
 
-    async def delete(self, collection: str, doc_id) -> bool:
-        try: await self._req("DELETE", f"/api/db/{collection}/{doc_id}"); return True
+    async def delete(self, col, doc_id):
+        try: await self._req("DELETE", f"/api/db/{col}/{doc_id}"); return True
         except DSSError: return False
 
     @staticmethod
-    def doc_id(doc: dict):
+    def doc_id(doc):
         if not isinstance(doc, dict): return None
         for k in ("id","_id","uuid","key","ID"):
             if k in doc and doc[k] is not None: return doc[k]
@@ -182,7 +215,7 @@ def new_owner_session() -> str:
     return token
 
 
-def check_owner(token: Optional[str]) -> bool:
+def check_owner(token):
     if not token: return False
     exp = _owner_sessions.get(token)
     if not exp: return False
@@ -195,14 +228,27 @@ def require_owner(lux_owner: Optional[str] = Cookie(None)):
     return True
 
 # ═══════════════════════════════════════════════════════════════════
-#  USERS
+#  USERS + TOKENS
 # ═══════════════════════════════════════════════════════════════════
 def sha256(s: str) -> str: return hashlib.sha256(s.encode()).hexdigest()
 
 
-async def get_user_by_id(uid: str) -> Optional[dict]:
+def gen_user_token() -> str:
+    """LUX-XXXX-XXXX — human-readable user token for charging."""
+    hex_str = secrets.token_hex(4).upper()
+    return f"LUX-{hex_str[:4]}-{hex_str[4:8]}"
+
+
+async def get_user_by_id(uid) -> Optional[dict]:
     for u in await dss.list("users"):
         if str(u.get("id")) == str(uid) or str(u.get("_id")) == str(uid): return u
+    return None
+
+
+async def get_user_by_token(token: str) -> Optional[dict]:
+    token = token.strip().upper()
+    for u in await dss.list("users"):
+        if str(u.get("user_token", "")).upper() == token: return u
     return None
 
 
@@ -229,13 +275,20 @@ async def ip_key_count(ip: str) -> int:
     return count
 
 
-async def create_free_key(ip: str, invite_code: str = "") -> dict:
+async def create_free_key(ip: str, invite_code: str = "", ua: str = "") -> dict:
     user_id = secrets.token_urlsafe(12)
+    user_token = gen_user_token()
+    # Ensure uniqueness
+    for _ in range(5):
+        if not await get_user_by_token(user_token): break
+        user_token = gen_user_token()
+
     user_doc = {
-        "id": user_id, "ip": ip, "credits": FREE_CREDITS,
-        "usage_count": 0, "is_banned": False,
+        "id": user_id, "user_token": user_token, "ip": ip,
+        "credits": FREE_CREDITS, "usage_count": 0, "is_banned": False,
         "invite_code": secrets.token_urlsafe(8),
         "invited_by": invite_code or "",
+        "user_agent": ua[:200],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     await dss.create("users", user_doc)
@@ -246,7 +299,7 @@ async def create_free_key(ip: str, invite_code: str = "") -> dict:
         "hash": sha256(plain), "prefix": prefix, "active": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
-    # Handle invite reward
+    # Invite reward
     if invite_code:
         try:
             for u in await dss.list("users"):
@@ -258,11 +311,12 @@ async def create_free_key(ip: str, invite_code: str = "") -> dict:
                         })
                     break
         except: pass
+    log.info(f"✅ New user {user_token} (UA: {ua[:40]})")
     return {"api_key": plain, "prefix": prefix, "credits": FREE_CREDITS,
-            "user_id": user_id, "invite_code": user_doc["invite_code"]}
+            "user_id": user_id, "user_token": user_token, "invite_code": user_doc["invite_code"]}
 
 
-async def deduct_credit(user_id: str) -> bool:
+async def deduct_credit(user_id) -> bool:
     user = await get_user_by_id(user_id)
     if not user: return False
     credits = int(user.get("credits", 0))
@@ -277,18 +331,18 @@ async def deduct_credit(user_id: str) -> bool:
     except: return False
 
 
-async def add_credits(user_id: str, amount: int) -> bool:
+async def add_credits(user_id, amount) -> bool:
     user = await get_user_by_id(user_id)
     if not user: return False
     did = DSS.doc_id(user)
     if did is None: return False
     try:
-        await dss.update("users", did, {"credits": int(user.get("credits", 0)) + amount})
+        await dss.update("users", did, {"credits": int(user.get("credits", 0)) + int(amount)})
         return True
     except: return False
 
 
-async def log_usage(user_id: str, action: str, status: str, duration_ms: int, size_bytes: int = 0):
+async def log_usage(user_id, action, status, duration_ms, size_bytes=0):
     try:
         await dss.create("usage_logs", {
             "id": secrets.token_urlsafe(12), "user_id": user_id,
@@ -299,7 +353,7 @@ async def log_usage(user_id: str, action: str, status: str, duration_ms: int, si
     except: pass
 
 
-async def authenticate(x_api_key: Optional[str]) -> dict:
+async def authenticate(x_api_key) -> dict:
     if not x_api_key: raise HTTPException(401, "X-API-Key required")
     rec = await find_api_key(x_api_key.strip())
     if not rec: raise HTTPException(401, "Invalid or revoked key")
@@ -332,39 +386,35 @@ async def save_tasks_config(cfg: dict) -> bool:
                 existing = doc; break
         if existing:
             did = DSS.doc_id(existing)
-            if did is not None:
-                await dss.update("app_config", did, cfg)
+            if did is not None: await dss.update("app_config", did, cfg)
         else:
             await dss.create("app_config", {"id": "tasks", **cfg})
         return True
     except Exception as e:
-        log.error(f"save_tasks_config: {e}")
-        return False
+        log.error(f"save_tasks_config: {e}"); return False
 
 
-async def get_user_claims(user_id: str) -> list:
-    try:
-        return [c for c in await dss.list("user_tasks") if c.get("user_id") == user_id]
+async def get_user_claims(user_id) -> list:
+    try: return [c for c in await dss.list("user_tasks") if c.get("user_id") == user_id]
     except: return []
 
 
-async def log_claim(user_id: str, task_id: str):
+async def log_claim(user_id, task_id):
     await dss.create("user_tasks", {
-        "id": secrets.token_urlsafe(12),
-        "user_id": user_id, "task_id": task_id,
+        "id": secrets.token_urlsafe(12), "user_id": user_id, "task_id": task_id,
         "claimed_at": datetime.now(timezone.utc).isoformat(),
     })
 
 # ═══════════════════════════════════════════════════════════════════
-#  IMAGE TOOLS (21 tools — compact)
+#  IMAGE TOOLS (21 tools compact)
 # ═══════════════════════════════════════════════════════════════════
-def _open(data: bytes) -> Image.Image:
+def _open(data):
     try:
         img = Image.open(io.BytesIO(data)); img.load(); return img
     except Exception as e: raise ValueError(f"Invalid: {e}")
 
 
-def _save(img: Image.Image, fmt="PNG", **kw) -> bytes:
+def _save(img, fmt="PNG", **kw):
     out = io.BytesIO(); img.save(out, format=fmt, **kw); return out.getvalue()
 
 
@@ -449,23 +499,21 @@ def t_sharpen(d, **kw):
     return (_save(img, "PNG", optimize=True), "image/png", "png") if img.mode == "RGBA" else (_save(img, "JPEG", quality=95, optimize=True), "image/jpeg", "jpg")
 
 
-def _filter_color(d, r_mul=1, g_mul=1, b_mul=1, sat=1):
+def _filter_color(d, rm=1, gm=1, bm=1, sat=1):
     img = _open(d).convert("RGB")
     if sat != 1: img = ImageEnhance.Color(img).enhance(sat)
     r, g, b = img.split()
-    r = r.point(lambda i: min(255, int(i * r_mul)))
-    g = g.point(lambda i: min(255, int(i * g_mul)))
-    b = b.point(lambda i: min(255, int(i * b_mul)))
-    img = Image.merge("RGB", (r, g, b))
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+    r = r.point(lambda i: min(255, int(i * rm))); g = g.point(lambda i: min(255, int(i * gm))); b = b.point(lambda i: min(255, int(i * bm)))
+    return _save(Image.merge("RGB", (r, g, b)), "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
 
 
 def t_warm(d, **kw): return _filter_color(d, 1.15, 1.02, 0.88)
 def t_cool(d, **kw): return _filter_color(d, 0.88, 1.02, 1.15)
+
+
 def t_vintage(d, **kw):
     img = _open(d).convert("RGB")
-    img = ImageEnhance.Color(img).enhance(0.6)
-    img = ImageEnhance.Contrast(img).enhance(1.1)
+    img = ImageEnhance.Color(img).enhance(0.6); img = ImageEnhance.Contrast(img).enhance(1.1)
     r, g, b = img.split()
     r = r.point(lambda i: min(255, i + 15)); b = b.point(lambda i: max(0, i - 15))
     return _save(Image.merge("RGB", (r, g, b)), "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
@@ -577,7 +625,8 @@ async def _keep_alive():
     while True:
         await asyncio.sleep(600)
         try:
-            async with httpx.AsyncClient(timeout=20.0) as c: await c.get(f"{url}/ping")
+            async with httpx.AsyncClient(timeout=20.0) as c:
+                await c.get(f"{url}/ping")   # ← هذا نظيف، لا ينشئ مستخدمين
         except: pass
 
 
@@ -585,7 +634,7 @@ async def _keep_alive():
 async def lifespan(app):
     bg = asyncio.create_task(_ensure_rembg_loaded())
     ka = asyncio.create_task(_keep_alive())
-    log.info("🚀 Lux Studio VIP v7 ready")
+    log.info("🚀 Lux Studio VIP v8 ready")
     try: yield
     finally:
         for t in (bg, ka): t.cancel()
@@ -595,7 +644,7 @@ async def lifespan(app):
 # ═══════════════════════════════════════════════════════════════════
 #  FASTAPI
 # ═══════════════════════════════════════════════════════════════════
-app = FastAPI(title="Lux Studio VIP", version="7.0.0", lifespan=lifespan)
+app = FastAPI(title="Lux Studio VIP", version="8.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -604,7 +653,9 @@ async def index(): return HTML_PAGE
 
 
 @app.get("/ping")
-async def ping(): return {"status": "alive", "ts": time.time(), "rembg_ready": _rembg_ready}
+async def ping(request: Request):
+    """Ping — pure, no side effects. Used by Render health check + external cron."""
+    return {"status": "alive", "ts": time.time(), "rembg_ready": _rembg_ready}
 
 
 @app.get("/manifest.json")
@@ -628,7 +679,7 @@ async def sw(): return Response(content=SW_JS, media_type="application/javascrip
 
 @app.get("/api/health")
 async def health():
-    r = {"status": "ok", "rembg_ready": _rembg_ready, "version": "7.0.0"}
+    r = {"status": "ok", "rembg_ready": _rembg_ready, "version": "8.0.0"}
     try:
         users = await dss.list("users"); r["dss"] = "connected"; r["dss_users"] = len(users)
     except Exception as e:
@@ -636,14 +687,21 @@ async def health():
     return r
 
 
-# ─── Keys (auto-create supported) ───
+# ═══════════════ Keys ═══════════════
 @app.post("/api/keys/new")
 async def api_new_key(request: Request, invite: str = ""):
+    """Creates a new user — ONLY for real browsers."""
+    human, reason = is_human_request(request)
+    if not human:
+        log.warning(f"🚫 Blocked non-human: {reason}")
+        raise HTTPException(403, f"Automated requests not allowed: {reason}")
+
     ip = request.client.host if request.client else "unknown"
     if not rate_check(f"key:{ip}"): raise HTTPException(429, "Too many attempts")
     try:
-        if await ip_key_count(ip) >= 3: raise HTTPException(429, "Max 3 keys/day")
-        return {**await create_free_key(ip, invite), "message": "Save this key"}
+        if await ip_key_count(ip) >= 3: raise HTTPException(429, "Max 3 keys/day per IP")
+        ua = request.headers.get("user-agent", "")[:200]
+        return {**await create_free_key(ip, invite, ua), "message": "Save this key"}
     except HTTPException: raise
     except DSSError as e: raise HTTPException(503, f"DB: {e}")
 
@@ -656,9 +714,11 @@ async def api_me(x_api_key: Optional[str] = Header(None)):
     try: logs = [l for l in await dss.list("usage_logs") if l.get("user_id") == rec.get("user_id")]
     except: logs = []
     return {
-        "prefix": rec.get("prefix"), "credits": int(user.get("credits", 0)),
+        "prefix": rec.get("prefix"),
+        "credits": int(user.get("credits", 0)),
         "total_operations": len(logs),
         "successful": sum(1 for l in logs if l.get("status") == "success"),
+        "user_token": user.get("user_token", ""),
         "invite_code": user.get("invite_code", ""),
         "created_at": user.get("created_at"),
     }
@@ -674,7 +734,7 @@ async def api_history(x_api_key: Optional[str] = Header(None)):
     except: return {"items": []}
 
 
-# ─── Tasks ───
+# ═══════════════ Tasks ═══════════════
 @app.get("/api/tasks")
 async def api_tasks(x_api_key: Optional[str] = Header(None)):
     rec = await authenticate(x_api_key)
@@ -682,7 +742,6 @@ async def api_tasks(x_api_key: Optional[str] = Header(None)):
     cfg = await get_tasks_config()
     claims = await get_user_claims(uid)
     claimed_ids = [c.get("task_id") for c in claims]
-
     now = datetime.now(timezone.utc)
     daily_claimed = False
     for c in claims:
@@ -691,7 +750,6 @@ async def api_tasks(x_api_key: Optional[str] = Header(None)):
                 ts = datetime.fromisoformat(str(c.get("claimed_at","")).replace("Z","+00:00"))
                 if (now - ts).total_seconds() < 86400: daily_claimed = True
             except: pass
-
     return {
         "daily_checkin": {**cfg["daily_checkin"], "claimed": daily_claimed},
         "share_app": {**cfg["share_app"], "claimed": "share_app" in claimed_ids},
@@ -710,8 +768,7 @@ async def api_checkin(x_api_key: Optional[str] = Header(None)):
         if c.get("task_id") == "daily_checkin":
             try:
                 ts = datetime.fromisoformat(str(c.get("claimed_at","")).replace("Z","+00:00"))
-                if (now - ts).total_seconds() < 86400:
-                    raise HTTPException(400, "Already claimed today")
+                if (now - ts).total_seconds() < 86400: raise HTTPException(400, "Already claimed today")
             except HTTPException: raise
             except: pass
     cfg = await get_tasks_config()
@@ -751,7 +808,7 @@ async def api_claim_link(link_id: str = Form(...), x_api_key: Optional[str] = He
     return {"ok": True, "reward": reward, "message": f"+{reward} نقطة!"}
 
 
-# ─── Image processing ───
+# ═══════════════ Image processing ═══════════════
 @app.post("/api/tool/{tool_name}")
 async def api_tool(tool_name: str, request: Request, file: UploadFile = File(...),
                   x_api_key: Optional[str] = Header(None)):
@@ -761,40 +818,33 @@ async def api_tool(tool_name: str, request: Request, file: UploadFile = File(...
     user = await get_user_by_id(uid)
     if not user or int(user.get("credits", 0)) < 1: raise HTTPException(402, "Out of credits")
     if not rate_check(f"user:{uid}"): raise HTTPException(429, "Slow down")
-
     data = await file.read()
     if not data: raise HTTPException(400, "Empty file")
     if len(data) > MAX_FILE_BYTES: raise HTTPException(413, f"Max {MAX_FILE_MB}MB")
     if tool_name == "remove-bg" and not _rembg_ready:
         try: await asyncio.wait_for(_rembg_event.wait(), timeout=120.0)
         except asyncio.TimeoutError: raise HTTPException(503, "Model loading")
-
     params = dict(request.query_params)
     for k in ("quality","radius","angle","width","height","brightness","contrast","saturation","opacity","thickness"):
         if k in params:
             try: params[k] = int(params[k])
             except: params.pop(k, None)
-
     t0 = time.time()
-    try:
-        result = await asyncio.to_thread(TOOLS[tool_name], data, **params)
+    try: result = await asyncio.to_thread(TOOLS[tool_name], data, **params)
     except ValueError as e:
         await log_usage(uid, tool_name, "error", 0); raise HTTPException(400, str(e))
     except Exception as e:
         await log_usage(uid, tool_name, "error", 0); raise HTTPException(500, str(e))
-
     if isinstance(result, tuple):
         result, media_type, ext = result if len(result) == 3 else (result[0], f"image/{result[1]}", result[1])
-    else:
-        media_type, ext = "image/png", "png"
-
+    else: media_type, ext = "image/png", "png"
     await deduct_credit(uid)
     await log_usage(uid, tool_name, "success", int((time.time()-t0)*1000), len(result))
     return Response(content=result, media_type=media_type,
                     headers={"Content-Disposition": f'attachment; filename="lux_{tool_name}.{ext}"'})
 
 
-# ─── Owner ───
+# ═══════════════ Owner ═══════════════
 @app.get("/owner", response_class=HTMLResponse)
 async def owner_page(lux_owner: Optional[str] = Cookie(None)):
     if check_owner(lux_owner): return OWNER_DASHBOARD_HTML
@@ -819,8 +869,7 @@ async def owner_logout(lux_owner: Optional[str] = Cookie(None)):
 @app.get("/api/owner/stats")
 async def owner_stats(lux_owner: Optional[str] = Cookie(None)):
     require_owner(lux_owner)
-    try:
-        users = await dss.list("users"); keys = await dss.list("api_keys"); logs = await dss.list("usage_logs")
+    try: users = await dss.list("users"); keys = await dss.list("api_keys"); logs = await dss.list("usage_logs")
     except DSSError as e: raise HTTPException(503, str(e))
     return {
         "users": len(users), "keys_total": len(keys),
@@ -846,19 +895,38 @@ async def owner_users(lux_owner: Optional[str] = Cookie(None)):
         uid = str(u.get("id") or u.get("_id") or "")
         k = key_by_user.get(uid) or {}
         items.append({
-            "id": uid, "ip": u.get("ip","-"), "credits": int(u.get("credits",0)),
+            "id": uid, "user_token": u.get("user_token", "-"),
+            "ip": u.get("ip","-"), "credits": int(u.get("credits",0)),
             "usage_count": int(u.get("usage_count",0)), "is_banned": bool(u.get("is_banned")),
             "created_at": u.get("created_at",""), "prefix": k.get("prefix","-"),
+            "ua": (u.get("user_agent","") or "")[:60],
         })
     items.sort(key=lambda x: x.get("created_at",""), reverse=True)
     return {"items": items[:300], "total": len(items)}
+
+
+@app.post("/api/owner/charge-by-token")
+async def owner_charge_by_token(user_token: str = Form(...), amount: int = Form(...),
+                                lux_owner: Optional[str] = Cookie(None)):
+    """Charge credits by user token (LUX-XXXX-XXXX)."""
+    require_owner(lux_owner)
+    if amount == 0: raise HTTPException(400, "Amount is zero")
+    user = await get_user_by_token(user_token)
+    if not user:
+        # Try by ID
+        user = await get_user_by_id(user_token)
+    if not user: raise HTTPException(404, "User not found")
+    uid = str(user.get("id"))
+    if not await add_credits(uid, amount): raise HTTPException(500, "Failed")
+    return {"ok": True, "user_id": uid, "user_token": user.get("user_token"),
+            "new_credits": int(user.get("credits", 0)) + amount}
 
 
 @app.post("/api/owner/user/credits")
 async def owner_user_credits(user_id: str = Form(...), amount: int = Form(...),
                             lux_owner: Optional[str] = Cookie(None)):
     require_owner(lux_owner)
-    if amount == 0: raise HTTPException(400, "Amount zero")
+    if amount == 0: raise HTTPException(400, "Amount is zero")
     if not await add_credits(user_id, amount): raise HTTPException(404, "Not found")
     return {"ok": True}
 
@@ -911,7 +979,7 @@ async def owner_change_password(old_password: str = Form(...), new_password: str
     return {"ok": True}
 
 # ═══════════════════════════════════════════════════════════════════
-#  MAIN HTML (Sidebar + 10 pages)
+#  MAIN HTML
 # ═══════════════════════════════════════════════════════════════════
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -928,7 +996,7 @@ HTML_PAGE = """<!DOCTYPE html>
 body.light{--bg:#f5f7fb;--bg2:#e8ecf4;--surface:#fff;--surface2:#f0f3f8;--border:rgba(0,0,0,.08);--text:#0a0e1a;--muted:#5a6478}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Tajawal',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6;overflow-x:hidden}
-body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;background:radial-gradient(circle at 15% 20%,rgba(0,224,255,.10),transparent 35%),radial-gradient(circle at 85% 15%,rgba(124,92,255,.12),transparent 35%),radial-gradient(circle at 50% 90%,rgba(255,45,149,.08),transparent 40%)}
+body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;background:radial-gradient(circle at 15% 20%,rgba(0,224,255,.10),transparent 35%),radial-gradient(circle at 85% 15%,rgba(124,92,255,.12),transparent 35%)}
 body.light::before{opacity:.35}
 a{color:var(--cyan);text-decoration:none}
 header{position:fixed;top:0;left:0;right:0;height:var(--hh);z-index:100;backdrop-filter:blur(20px);background:rgba(5,7,15,.85);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 14px}
@@ -937,7 +1005,6 @@ body.light header{background:rgba(245,247,251,.85)}
 .ham:hover{background:var(--surface2)}
 .h-title{font-weight:900;font-size:1rem;text-align:center;flex:1}
 .h-title small{display:block;font-size:.65rem;color:var(--muted);font-weight:600}
-.h-actions{display:flex;gap:8px}
 .icon-btn{background:var(--surface2);border:1px solid var(--border);color:var(--text);width:42px;height:42px;border-radius:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:1rem;text-decoration:none}
 .icon-btn:hover{background:rgba(255,255,255,.12)}
 .overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;opacity:0;pointer-events:none;transition:opacity .3s;backdrop-filter:blur(4px)}
@@ -950,6 +1017,7 @@ body.light .drawer{background:#fff}
 .d-logo span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
 .d-user{margin-top:10px;padding:10px;background:var(--surface);border-radius:10px;font-size:.78rem}
 .d-user .cr{font-size:1.2rem;font-weight:900;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-family:'JetBrains Mono',monospace}
+.d-user .tk{font-size:.68rem;color:var(--muted);font-family:'JetBrains Mono',monospace;margin-top:4px;direction:ltr}
 .d-nav{flex:1;padding:10px 0}
 .nav-item{display:flex;align-items:center;gap:12px;padding:13px 20px;color:var(--text);cursor:pointer;border:none;background:transparent;width:100%;text-align:right;font-family:inherit;font-size:.92rem;font-weight:600;transition:background .2s;border-right:3px solid transparent}
 .nav-item:hover{background:var(--surface)}
@@ -977,7 +1045,7 @@ main{padding-top:calc(var(--hh) + 14px);padding-bottom:40px;max-width:1000px;mar
 .btn-block{width:100%}
 .btn-lg{padding:15px 26px;font-size:.95rem}
 .upload-zone{border:2px dashed var(--border);border-radius:16px;padding:38px 20px;text-align:center;cursor:pointer;transition:all .25s;background:var(--surface);margin-bottom:16px}
-.upload-zone:hover,.upload-zone.dragover{border-color:var(--cyan);background:rgba(0,224,255,.05)}
+.upload-zone:hover{border-color:var(--cyan);background:rgba(0,224,255,.05)}
 .upload-zone svg{width:42px;height:42px;stroke:var(--cyan);margin-bottom:10px}
 .upload-zone h3{font-size:1rem;margin-bottom:4px}
 .upload-zone p{color:var(--muted);font-size:.8rem}
@@ -1003,6 +1071,10 @@ main{padding-top:calc(var(--hh) + 14px);padding-bottom:40px;max-width:1000px;mar
 .key-display{display:flex;gap:6px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:10px 12px;align-items:center;font-family:'JetBrains Mono',monospace;font-size:.75rem;margin-bottom:8px;word-break:break-all}
 .key-display span{flex:1;color:var(--cyan);text-align:left;direction:ltr;overflow:hidden}
 .key-display button{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 9px;border-radius:6px;cursor:pointer;font-weight:700;font-size:.72rem}
+.token-box{background:linear-gradient(135deg,rgba(0,224,255,.08),rgba(124,92,255,.08));border:1px solid rgba(0,224,255,.3);border-radius:14px;padding:18px;text-align:center;margin-bottom:14px}
+.token-box .ttl{font-size:.75rem;color:var(--muted);margin-bottom:8px;font-weight:700;text-transform:uppercase;letter-spacing:1px}
+.token-box .tk{font-family:'JetBrains Mono',monospace;font-size:1.4rem;font-weight:800;color:var(--cyan);letter-spacing:2px;margin-bottom:10px;direction:ltr}
+.token-box .hint{font-size:.75rem;color:var(--muted);line-height:1.5}
 .history-item{display:flex;justify-content:space-between;align-items:center;padding:11px;background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;font-size:.82rem}
 .toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(150%);background:var(--bg2);border:1px solid var(--border);padding:12px 20px;border-radius:12px;z-index:999;font-weight:600;font-size:.88rem;transition:transform .3s;max-width:calc(100% - 32px);text-align:center}
 .toast.show{transform:translateX(-50%) translateY(0)}
@@ -1024,24 +1096,42 @@ main{padding-top:calc(var(--hh) + 14px);padding-bottom:40px;max-width:1000px;mar
 .task-card .info{flex:1}
 .task-card .title{font-weight:700;font-size:.92rem}
 .task-card .reward{color:var(--success);font-size:.82rem;font-weight:700;margin-top:2px}
-.task-card .btn{flex-shrink:0}
 .task-card.done{opacity:.6}
 .badge-claimed{background:rgba(0,255,163,.15);color:var(--success);padding:4px 10px;border-radius:20px;font-size:.72rem;font-weight:700}
 .banner{background:linear-gradient(135deg,rgba(0,224,255,.08),rgba(124,92,255,.08));border:1px solid rgba(0,224,255,.25);border-radius:14px;padding:18px;text-align:center;margin-bottom:16px}
 </style>
 </head>
 <body>
+
+<!-- ═══════ WELCOME OVERLAY (shown once, requires click → creates key) ═══════ -->
+<div id="welcome-overlay" class="modal-overlay" style="z-index:250">
+<div class="modal" style="text-align:center">
+<div style="font-size:3rem;margin-bottom:12px">👑</div>
+<h3 style="margin-bottom:8px">مرحباً بك في Lux VIP</h3>
+<p style="color:var(--muted);font-size:.88rem;margin-bottom:20px;line-height:1.6">
+احصل على <b style="color:var(--cyan)">30 عملية مجانية</b> للبدء<br>
+يُولَّد لك مفتاح شخصي تلقائياً عند الضغط على "ابدأ"
+</p>
+<button class="btn btn-primary btn-block btn-lg" onclick="getStarted()">🚀 ابدأ الآن</button>
+<p style="color:var(--muted);font-size:.72rem;margin-top:12px">بالضغط أنت توافق على الاستخدام العادل</p>
+</div>
+</div>
+
 <header>
 <button class="ham" onclick="openDrawer()">☰</button>
-<div class="h-title"><span id="h-title">Lux Studio</span><small id="h-sub">VIP v7</small></div>
-<div class="h-actions"><a href="/owner" class="icon-btn" title="المالك">👑</a></div>
+<div class="h-title"><span id="h-title">Lux Studio</span><small id="h-sub">VIP v8</small></div>
+<div style="display:flex;gap:8px"><a href="/owner" class="icon-btn" title="المالك">👑</a></div>
 </header>
 
 <div class="overlay" id="overlay" onclick="closeDrawer()"></div>
 <aside class="drawer" id="drawer">
 <div class="d-head">
 <div class="d-logo">Lux<span>.</span>VIP</div>
-<div class="d-user"><div style="font-size:.68rem;color:var(--muted);margin-bottom:2px">رصيدك</div><div class="cr" id="d-credits">-</div></div>
+<div class="d-user">
+<div style="font-size:.68rem;color:var(--muted);margin-bottom:2px">رصيدك</div>
+<div class="cr" id="d-credits">-</div>
+<div class="tk" id="d-token">-</div>
+</div>
 </div>
 <nav class="d-nav">
 <button class="nav-item active" data-page="home" onclick="navigate('home')"><span class="ico">🏠</span>الرئيسية</button>
@@ -1049,12 +1139,13 @@ main{padding-top:calc(var(--hh) + 14px);padding-bottom:40px;max-width:1000px;mar
 <button class="nav-item" data-page="enhance" onclick="navigate('enhance')"><span class="ico">✨</span>تحسين الجودة</button>
 <button class="nav-item" data-page="designer" onclick="navigate('designer')"><span class="ico">🎨</span>أدوات المصمم</button>
 <button class="nav-item" data-page="tasks" onclick="navigate('tasks')"><span class="ico">🎁</span>المهام والجوائز</button>
+<button class="nav-item" data-page="profile" onclick="navigate('profile')"><span class="ico">👤</span>ملفي الشخصي</button>
 <button class="nav-item" data-page="api" onclick="navigate('api')"><span class="ico">🔑</span>مفاتيح API</button>
 <button class="nav-item" data-page="history" onclick="navigate('history')"><span class="ico">📜</span>سجلي</button>
 <button class="nav-item" data-page="settings" onclick="navigate('settings')"><span class="ico">⚙️</span>الإعدادات</button>
 <button class="nav-item" data-page="help" onclick="navigate('help')"><span class="ico">❓</span>المساعدة</button>
 </nav>
-<div class="d-foot">Lux Studio VIP v7<br>© 2025 — Premium ✨</div>
+<div class="d-foot">Lux Studio VIP v8<br>© 2025</div>
 </aside>
 
 <button class="install-btn" id="install-btn" onclick="doInstall()">📱 تثبيت</button>
@@ -1064,7 +1155,7 @@ main{padding-top:calc(var(--hh) + 14px);padding-bottom:40px;max-width:1000px;mar
 <!-- HOME -->
 <section class="page" id="page-home">
 <h1>👋 أهلاً بك</h1>
-<p class="sub">Lux Studio VIP — 21 أداة مصمم + مهام</p>
+<p class="sub">21 أداة مصمم + مهام + جوائز</p>
 <div class="stats-grid">
 <div class="stat"><div class="num" id="st-credits">-</div><div class="lbl">نقطة</div></div>
 <div class="stat"><div class="num" id="st-ops">-</div><div class="lbl">عملية</div></div>
@@ -1131,9 +1222,9 @@ main{padding-top:calc(var(--hh) + 14px);padding-bottom:40px;max-width:1000px;mar
 <button class="tool-btn" onclick="runSimple('convert',{target:'webp'})"><span class="ic">🔄</span>WEBP</button>
 <button class="tool-btn" onclick="openModal('modal-crop')"><span class="ic">✂️</span>قص</button>
 <button class="tool-btn" onclick="openModal('modal-resize')"><span class="ic">📐</span>تحجيم</button>
-<button class="tool-btn" onclick="openModal('modal-wm')"><span class="ic">💧</span>علامة مائية</button>
+<button class="tool-btn" onclick="openModal('modal-wm')"><span class="ic">💧</span>علامة</button>
 <button class="tool-btn" onclick="openModal('modal-adjust')"><span class="ic">🎚️</span>ضبط</button>
-<button class="tool-btn" onclick="openModal('modal-bg')"><span class="ic">🎨</span>خلفية لون</button>
+<button class="tool-btn" onclick="openModal('modal-bg')"><span class="ic">🎨</span>خلفية</button>
 <button class="tool-btn" onclick="runSimple('round-corners',{radius:40})"><span class="ic">⭕</span>زوايا</button>
 <button class="tool-btn" onclick="runSimple('border',{thickness:20})"><span class="ic">🖼️</span>إطار</button>
 </div>
@@ -1145,11 +1236,45 @@ main{padding-top:calc(var(--hh) + 14px);padding-bottom:40px;max-width:1000px;mar
 <section class="page hidden" id="page-tasks">
 <h1>🎁 المهام والجوائز</h1>
 <p class="sub">اكسب نقاط مجانية</p>
-<div class="banner">
-<div style="font-size:1.8rem;margin-bottom:6px">🏆</div>
-<div style="font-weight:700">اجمع النقاط من المهام والاشتراكات</div>
-</div>
+<div class="banner"><div style="font-size:1.8rem;margin-bottom:6px">🏆</div><div style="font-weight:700">اجمع النقاط من المهام</div></div>
 <div id="tasks-list"><div class="loading"><div class="spinner"></div><p>جاري التحميل...</p></div></div>
+</section>
+
+<!-- PROFILE — NEW PAGE -->
+<section class="page hidden" id="page-profile">
+<h1>👤 ملفي الشخصي</h1>
+<p class="sub">بياناتك وتوكن الشحن</p>
+
+<div class="token-box">
+<div class="ttl">🎫 توكن المستخدم</div>
+<div class="tk" id="profile-token">-</div>
+<button class="btn btn-primary" onclick="copyToken()">📋 نسخ التوكن</button>
+<div class="hint" style="margin-top:12px">
+شارك هذا التوكن مع المالك لشحن رصيدك<br>
+مثال: <b>LUX-A3B5-C7D9</b>
+</div>
+</div>
+
+<div class="stats-grid">
+<div class="stat"><div class="num" id="p-credits">-</div><div class="lbl">النقاط</div></div>
+<div class="stat"><div class="num" id="p-ops">-</div><div class="lbl">العمليات</div></div>
+<div class="stat"><div class="num" id="p-success">-</div><div class="lbl">الناجحة</div></div>
+</div>
+
+<div class="card">
+<h3>🎟️ رابط الدعوة</h3>
+<p style="color:var(--muted);font-size:.82rem;margin-bottom:10px">شارك الرابط → صديقك ينضم → تحصل على نقاط</p>
+<div class="key-display">
+<span id="invite-link" style="font-size:.68rem">-</span>
+<button onclick="copyInvite()">📋</button>
+</div>
+<button class="btn btn-secondary btn-block" onclick="shareInvite()" style="margin-top:8px">📤 مشاركة</button>
+</div>
+
+<div class="card">
+<h3>📅 تاريخ الانضمام</h3>
+<p id="p-joined" style="color:var(--muted);font-size:.85rem">-</p>
+</div>
 </section>
 
 <!-- API -->
@@ -1208,10 +1333,10 @@ curl -X POST "YOUR/api/tool/remove-bg" \\
 <section class="page hidden" id="page-help">
 <h1>❓ المساعدة</h1>
 <p class="sub">دليل سريع</p>
-<div class="card"><h3>🔑 المفتاح</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">يتم إنشاؤه تلقائيًا عند أول زيارة. تجده في صفحة API. لا تشاركه مع أحد.</p></div>
-<div class="card"><h3>💳 النقاط</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">كل عملية تستهلك نقطة. اكسب نقاطًا من صفحة <b>المهام</b>.</p></div>
-<div class="card"><h3>⚡ بطء أول عملية</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">موديل إزالة الخلفية يُحمَّل مرة واحدة (30-90ث). بعدها كل شيء سريع.</p></div>
-<div class="card"><h3>🆘 الدعم</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">تواصل مع المالك عبر <a href="/owner">/owner</a></p></div>
+<div class="card"><h3>🔑 المفتاح</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">يتم إنشاؤه عند ضغط "ابدأ" — تجده في صفحة API.</p></div>
+<div class="card"><h3>🎫 توكن الشحن</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">في صفحة "ملفي الشخصي" — شاركه مع المالك لشحن النقاط.</p></div>
+<div class="card"><h3>💳 النقاط</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">كل عملية = نقطة. اكسب المزيد من صفحة المهام.</p></div>
+<div class="card"><h3>⚡ بطء أول عملية</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">موديل إزالة الخلفية يُحمَّل مرة واحدة (~60ث) ثم يصبح سريعاً.</p></div>
 </section>
 
 </main>
@@ -1254,27 +1379,32 @@ curl -X POST "YOUR/api/tool/remove-bg" \\
 <div class="toast" id="toast"></div>
 
 <script>
-// ═══════════ STATE ═══════════
+// ═══════════════ STATE ═══════════════
 const state = {
   key: localStorage.getItem('lux_api_key') || null,
+  token: localStorage.getItem('lux_user_token') || null,
+  inviteCode: localStorage.getItem('lux_invite_code') || null,
   currentPage: 'home',
   currentFile: null,
   currentSource: null,
   theme: localStorage.getItem('lux_theme') || 'dark',
   keyVisible: false,
   deferredPrompt: null,
-  autoKeyTried: false,
-  tasksConfig: null,
 };
 
 const PAGES = {
-  home:{t:'الرئيسية',s:'Lux Studio VIP'}, 'remove-bg':{t:'إزالة الخلفية',s:'شفافية احترافية'},
-  enhance:{t:'تحسين الجودة',s:'تكبير ×2'}, designer:{t:'أدوات المصمم',s:'19 أداة'},
-  tasks:{t:'المهام والجوائز',s:'اكسب نقاط'}, api:{t:'مفاتيح API',s:'اربط خدماتك'},
-  history:{t:'سجلي',s:'عملياتك'}, settings:{t:'الإعدادات',s:'تخصيص'}, help:{t:'المساعدة',s:'دليل سريع'},
+  home:{t:'الرئيسية',s:'Lux Studio VIP v8'},
+  'remove-bg':{t:'إزالة الخلفية',s:'شفافية احترافية'},
+  enhance:{t:'تحسين الجودة',s:'تكبير ×2'},
+  designer:{t:'أدوات المصمم',s:'19 أداة'},
+  tasks:{t:'المهام والجوائز',s:'اكسب نقاط'},
+  profile:{t:'ملفي الشخصي',s:'توكن الشحن'},
+  api:{t:'مفاتيح API',s:'اربط خدماتك'},
+  history:{t:'سجلي',s:'عملياتك'},
+  settings:{t:'الإعدادات',s:'تخصيص'},
+  help:{t:'المساعدة',s:'دليل سريع'},
 };
 
-// ═══════════ NAV ═══════════
 function navigate(page){
   if(!PAGES[page]) page='home';
   state.currentPage=page;
@@ -1288,24 +1418,43 @@ function navigate(page){
   window.scrollTo({top:0,behavior:'smooth'});
   if(page==='history') loadHistory();
   if(page==='tasks') loadTasks();
+  if(page==='profile') loadProfile();
   history.replaceState(null,'','#/'+page);
 }
 function openDrawer(){document.getElementById('drawer').classList.add('open');document.getElementById('overlay').classList.add('open')}
 function closeDrawer(){document.getElementById('drawer').classList.remove('open');document.getElementById('overlay').classList.remove('open')}
 
-// ═══════════ TOAST ═══════════
 function toast(m,t='success'){const el=document.getElementById('toast');el.textContent=m;el.className='toast show '+t;clearTimeout(el._t);el._t=setTimeout(()=>el.className='toast '+t,3500)}
 
-// ═══════════ MODALS ═══════════
 function openModal(id){if(!state.currentFile)return toast('❌ اختر صورة أولاً','error');document.getElementById(id).classList.add('show')}
 function closeModal(id){document.getElementById(id).classList.remove('show')}
-document.querySelectorAll('.modal-overlay').forEach(m=>m.addEventListener('click',e=>{if(e.target===m)m.classList.remove('show')}));
+document.querySelectorAll('.modal-overlay').forEach(m=>m.addEventListener('click',e=>{if(e.target===m&&m.id!=='welcome-overlay')m.classList.remove('show')}));
 
-// ═══════════ THEME ═══════════
 function setTheme(t){state.theme=t;localStorage.setItem('lux_theme',t);applyTheme();toast(t==='light'?'☀️ فاتح':'🌙 داكن')}
 function applyTheme(){document.body.classList.toggle('light',state.theme==='light')}
 
-// ═══════════ KEY AUTO-CREATION ═══════════
+// ═══════════════ KEY — NO AUTO-CREATE ON LOAD ═══════════════
+function hideWelcome(){
+  const w = document.getElementById('welcome-overlay');
+  if(w) w.classList.remove('show');
+}
+
+async function getStarted(){
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = '⏳ جاري الإنشاء...';
+  const k = await ensureKey();
+  if(k){
+    hideWelcome();
+    toast('🎉 تم إنشاء حسابك! 30 نقطة في رصيدك');
+    await refreshUser();
+    navigate('home');
+  } else {
+    btn.disabled = false;
+    btn.textContent = '🚀 ابدأ الآن';
+  }
+}
+
 async function ensureKey(invite=''){
   if(state.key) return state.key;
   try{
@@ -1314,7 +1463,11 @@ async function ensureKey(invite=''){
     const d=await r.json();
     if(!r.ok) throw new Error(d.detail||'فشل');
     state.key=d.api_key;
+    state.token=d.user_token;
+    state.inviteCode=d.invite_code;
     localStorage.setItem('lux_api_key',d.api_key);
+    localStorage.setItem('lux_user_token',d.user_token||'');
+    localStorage.setItem('lux_invite_code',d.invite_code||'');
     return state.key;
   }catch(e){
     toast('❌ '+e.message,'error');
@@ -1327,8 +1480,10 @@ async function refreshUser(){
   try{
     const r=await fetch('/api/me',{headers:{'X-API-Key':state.key}});
     if(r.status===401){
-      localStorage.removeItem('lux_api_key');state.key=null;
-      if(!state.autoKeyTried){state.autoKeyTried=true;await ensureKey();return refreshUser()}
+      localStorage.removeItem('lux_api_key');
+      localStorage.removeItem('lux_user_token');
+      state.key=null; state.token=null;
+      hideWelcome();
       return;
     }
     if(!r.ok) return;
@@ -1337,22 +1492,66 @@ async function refreshUser(){
     document.getElementById('st-ops').textContent=d.total_operations;
     document.getElementById('st-success').textContent=d.successful;
     document.getElementById('d-credits').textContent=d.credits;
+    document.getElementById('d-token').textContent=d.user_token||'-';
     document.getElementById('api-key-masked').textContent=state.keyVisible?state.key:maskKey(state.key);
+    state.token=d.user_token; state.inviteCode=d.invite_code;
+    if(d.user_token) localStorage.setItem('lux_user_token',d.user_token);
+    if(d.invite_code) localStorage.setItem('lux_invite_code',d.invite_code);
+    hideWelcome();
   }catch(e){}
 }
 
 function maskKey(k){return k?k.slice(0,10)+'••••••'+k.slice(-4):'-'}
 function toggleKeyVis(){state.keyVisible=!state.keyVisible;document.getElementById('api-key-masked').textContent=state.keyVisible?state.key:maskKey(state.key);document.getElementById('btn-toggle').textContent=state.keyVisible?'🙈':'👁'}
 function copyApiKey(){if(state.key)navigator.clipboard.writeText(state.key).then(()=>toast('📋 تم النسخ'))}
+function copyToken(){
+  const tk = state.token || localStorage.getItem('lux_user_token');
+  if(tk) navigator.clipboard.writeText(tk).then(()=>toast('📋 تم نسخ التوكن'));
+  else toast('❌ لا يوجد توكن','error');
+}
 async function regenerateKey(){
   if(!confirm('توليد مفتاح جديد؟ المفتاح القديم سيتوقف.'))return;
-  state.key=null;localStorage.removeItem('lux_api_key');
-  await ensureKey();
-  toast('✅ مفتاح جديد');
-  await refreshUser();
+  state.key=null; state.token=null;
+  localStorage.removeItem('lux_api_key');
+  localStorage.removeItem('lux_user_token');
+  const k=await ensureKey();
+  if(k){toast('✅ مفتاح جديد');await refreshUser();}
 }
 
-// ═══════════ FILE ═══════════
+// ═══════════════ PROFILE ═══════════════
+async function loadProfile(){
+  if(!state.key){await ensureKey();}
+  if(!state.key) return;
+  try{
+    const r=await fetch('/api/me',{headers:{'X-API-Key':state.key}});
+    if(!r.ok) return;
+    const d=await r.json();
+    state.token=d.user_token;
+    state.inviteCode=d.invite_code;
+    document.getElementById('profile-token').textContent=d.user_token||'-';
+    document.getElementById('p-credits').textContent=d.credits;
+    document.getElementById('p-ops').textContent=d.total_operations;
+    document.getElementById('p-success').textContent=d.successful;
+    const link = location.origin + '/?invite=' + (d.invite_code||'');
+    document.getElementById('invite-link').textContent = link;
+    const dt = d.created_at ? new Date(d.created_at).toLocaleDateString('ar-SA') : '-';
+    document.getElementById('p-joined').textContent = dt;
+  }catch(e){}
+}
+function copyInvite(){
+  const link = document.getElementById('invite-link').textContent;
+  navigator.clipboard.writeText(link).then(()=>toast('📋 تم النسخ'));
+}
+function shareInvite(){
+  const link = document.getElementById('invite-link').textContent;
+  if(navigator.share){
+    navigator.share({title:'Lux Studio VIP',text:'انضم إلي واحصل على أدوات تصميم مجانية!',url:link}).catch(()=>{});
+  } else {
+    navigator.clipboard.writeText(link).then(()=>toast('📋 تم النسخ — شاركه'));
+  }
+}
+
+// ═══════════════ FILE ═══════════════
 function pickFile(src){state.currentSource=src;document.getElementById('file-'+src).click()}
 ['remove-bg','enhance','designer'].forEach(src=>{
   document.getElementById('file-'+src).addEventListener('change',e=>{
@@ -1369,20 +1568,17 @@ function handleFile(file,src){
     document.getElementById('designer-tools').classList.remove('hidden');
     document.getElementById('result-designer').classList.add('hidden');
     toast('📸 اختر أداة');
-  }else if(src==='remove-bg'){
-    executeTool('remove-bg',{},'result-remove-bg');
-  }else if(src==='enhance'){
-    executeTool('enhance',{},'result-enhance');
-  }
+  }else if(src==='remove-bg')executeTool('remove-bg',{},'result-remove-bg');
+  else if(src==='enhance')executeTool('enhance',{},'result-enhance');
 }
 
-// ═══════════ EXECUTE ═══════════
 async function executeTool(name,params,resultId){
   if(!state.currentFile)return toast('❌ اختر صورة','error');
-  // ── Auto-create key if missing ──
+  // Auto-create key on user action (not on page load)
   if(!state.key){
     const k=await ensureKey();
     if(!k) return toast('❌ تعذر إنشاء المفتاح','error');
+    hideWelcome();
   }
   const container=document.getElementById(resultId);
   container.classList.remove('hidden');
@@ -1409,8 +1605,8 @@ async function executeTool(name,params,resultId){
     reader.onload=e=>{
       container.innerHTML=`
         <div class="preview-row">
-          <div class="img-box"><div class="label">الأصلية</div><img src="${e.target.result}" alt=""></div>
-          <div class="img-box"><div class="label">النتيجة</div><div class="${name==='remove-bg'?'checker':''}"><img src="${objUrl}" alt=""></div></div>
+          <div class="img-box"><div class="label">الأصلية</div><img src="${e.target.result}"></div>
+          <div class="img-box"><div class="label">النتيجة</div><div class="${name==='remove-bg'?'checker':''}"><img src="${objUrl}"></div></div>
         </div>
         <div class="grid-2">
           <a href="${objUrl}" download="lux_${name}.${ext}" class="btn btn-primary">⬇️ تحميل</a>
@@ -1430,7 +1626,6 @@ function runSimple(name,params={}){
   if(!state.currentFile)return toast('❌ اختر صورة','error');
   executeTool(name,params,'result-designer');
 }
-
 function resetPage(src){
   state.currentFile=null;
   document.getElementById('file-'+src).value='';
@@ -1439,14 +1634,13 @@ function resetPage(src){
   else if(src==='enhance')document.getElementById('result-enhance').classList.add('hidden');
 }
 
-// ═══════════ MODAL ACTIONS ═══════════
 function doCrop(){const r=document.getElementById('crop-ratio').value;closeModal('modal-crop');runSimple('crop',{ratio:r})}
 function doResize(){const w=document.getElementById('rz-w').value,h=document.getElementById('rz-h').value;if(!w&&!h)return toast('❌ أدخل قيمة','error');closeModal('modal-resize');const p={};if(w)p.width=+w;if(h)p.height=+h;runSimple('resize',p)}
 function doWm(){const t=document.getElementById('wm-text').value||'Lux Studio';const p=document.getElementById('wm-pos').value;const o=+document.getElementById('wm-op').value;closeModal('modal-wm');runSimple('watermark',{text:t,position:p,opacity:o})}
 function doAdjust(){const b=+document.getElementById('adj-b').value,c=+document.getElementById('adj-c').value,s=+document.getElementById('adj-s').value;if(!b&&!c&&!s)return toast('⚠️ لا تغيير','error');closeModal('modal-adjust');runSimple('adjust',{brightness:b,contrast:c,saturation:s})}
 function doBg(){const c=document.getElementById('bg-color').value;closeModal('modal-bg');runSimple('bg-color',{color:c})}
 
-// ═══════════ TASKS ═══════════
+// ═══════════════ TASKS ═══════════════
 async function loadTasks(){
   const el=document.getElementById('tasks-list');
   if(!state.key){const k=await ensureKey();if(!k)return el.innerHTML='<div class="card">تعذر الاتصال</div>'}
@@ -1456,11 +1650,8 @@ async function loadTasks(){
     if(!r.ok) throw new Error();
     const d=await r.json();
     let html='';
-    // Daily checkin
     html+=renderTask('daily_checkin',d.daily_checkin,'📅','checkin');
-    // Share
     html+=renderTask('share_app',d.share_app,'📤','share');
-    // Links
     d.links.forEach(lk=>{
       html+=`<div class="task-card ${lk.claimed?'done':''}">
         <div class="info"><div class="title">${lk.icon||'🔗'} ${lk.title}</div><div class="reward">+${lk.reward} نقطة</div></div>
@@ -1502,10 +1693,10 @@ async function claimLink(linkId){
     toast('🎉 '+d.message);
     await refreshUser();
     await loadTasks();
-  }catch(e){/* silent */}
+  }catch(e){}
 }
 
-// ═══════════ HISTORY ═══════════
+// ═══════════════ HISTORY ═══════════════
 async function loadHistory(){
   const el=document.getElementById('hist-box');
   if(!state.key) return el.innerHTML='<div style="text-align:center;padding:20px;color:var(--muted)">لا يوجد سجل</div>';
@@ -1525,23 +1716,25 @@ async function loadHistory(){
   }catch(e){el.innerHTML='<div style="color:var(--danger);text-align:center;padding:20px">فشل</div>'}
 }
 
-// ═══════════ PWA ═══════════
+// ═══════════════ PWA ═══════════════
 window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();state.deferredPrompt=e;document.getElementById('install-btn').classList.add('show')});
 function doInstall(){if(!state.deferredPrompt)return toast('افتح في Chrome على جوالك','error');state.deferredPrompt.prompt();state.deferredPrompt.userChoice.then(()=>{state.deferredPrompt=null;document.getElementById('install-btn').classList.remove('show')})}
 
-// ═══════════ INIT ═══════════
-window.addEventListener('DOMContentLoaded',async()=>{
+// ═══════════════ INIT — NO AUTO-CREATE ON LOAD ═══════════════
+window.addEventListener('DOMContentLoaded', async()=>{
   applyTheme();
   if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(()=>{});
-  // ── AUTO-CREATE KEY ON FIRST VISIT ──
-  if(!state.key){
-    const invite=new URLSearchParams(location.search).get('invite')||'';
-    await ensureKey(invite);
+  // CRITICAL: Do NOT auto-create key on page load
+  if(state.key){
+    hideWelcome();
+    await refreshUser();
+  } else {
+    // Show welcome overlay with "Start" button
+    document.getElementById('welcome-overlay').classList.add('show');
   }
-  await refreshUser();
   const page=location.hash.replace('#/','')||'home';
   navigate(page);
-  setInterval(refreshUser,60000);
+  setInterval(()=>{ if(state.key) refreshUser(); }, 60000);
 });
 window.addEventListener('hashchange',()=>{const p=location.hash.replace('#/','')||'home';if(p!==state.currentPage)navigate(p)});
 </script>
@@ -1579,12 +1772,23 @@ h1{font-size:1.4rem;margin-bottom:18px}
 .stat{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;text-align:center}
 .stat .num{font-size:1.5rem;font-weight:900;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-family:monospace}
 .stat .lbl{color:var(--muted);font-size:.72rem;margin-top:2px}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px;overflow-x:auto;margin-bottom:14px}
-table{width:100%;border-collapse:collapse;font-size:.8rem;min-width:600px}
-th{text-align:right;padding:10px 6px;color:var(--muted);font-size:.7rem;text-transform:uppercase;border-bottom:1px solid var(--border)}
-td{padding:10px 6px;border-bottom:1px solid rgba(255,255,255,.03)}
-.mono{font-family:monospace;font-size:.72rem;color:var(--cyan)}
-.btn{padding:5px 10px;border:none;border-radius:6px;font-size:.7rem;font-weight:700;cursor:pointer;margin:1px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px;margin-bottom:14px;overflow-x:auto}
+.charge-box{background:linear-gradient(135deg,rgba(0,224,255,.08),rgba(124,92,255,.08));border:1px solid rgba(0,224,255,.3);border-radius:14px;padding:20px;margin-bottom:22px}
+.charge-box h3{font-size:1.1rem;margin-bottom:12px}
+.charge-form{display:grid;grid-template-columns:2fr 1fr auto;gap:10px;align-items:end}
+@media(max-width:700px){.charge-form{grid-template-columns:1fr}}
+.charge-form input{padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:var(--bg);color:var(--text);font-family:'JetBrains Mono',monospace;font-size:1rem;font-weight:700}
+.charge-form input:focus{outline:none;border-color:var(--cyan)}
+.charge-form button{padding:12px 24px;background:var(--grad);color:var(--bg);border:none;border-radius:10px;font-weight:800;cursor:pointer;font-size:.9rem;white-space:nowrap}
+.charge-result{margin-top:14px;padding:12px;border-radius:10px;font-weight:700;font-size:.88rem;display:none}
+.charge-result.ok{display:block;background:rgba(0,255,163,.15);color:var(--success);border:1px solid rgba(0,255,163,.3)}
+.charge-result.err{display:block;background:rgba(255,77,109,.15);color:var(--danger);border:1px solid rgba(255,77,109,.3)}
+table{width:100%;border-collapse:collapse;font-size:.78rem;min-width:700px}
+th{text-align:right;padding:9px 6px;color:var(--muted);font-size:.68rem;text-transform:uppercase;border-bottom:1px solid var(--border)}
+td{padding:9px 6px;border-bottom:1px solid rgba(255,255,255,.03)}
+.mono{font-family:monospace;font-size:.7rem;color:var(--cyan)}
+.token-cell{font-family:monospace;font-size:.72rem;font-weight:700;color:var(--cyan);background:rgba(0,224,255,.08);padding:2px 6px;border-radius:4px}
+.btn{padding:5px 10px;border:none;border-radius:6px;font-size:.68rem;font-weight:700;cursor:pointer;margin:1px}
 .btn-add{background:rgba(0,255,163,.15);color:var(--success);border:1px solid rgba(0,255,163,.3)}
 .btn-ban{background:rgba(255,176,32,.15);color:#ffb020;border:1px solid rgba(255,176,32,.3)}
 .panel{display:none}.panel.active{display:block}
@@ -1598,11 +1802,13 @@ td{padding:10px 6px;border-bottom:1px solid rgba(255,255,255,.03)}
 .toast.show{transform:translateX(-50%) translateY(0)}
 .toast.success{border-color:rgba(0,255,163,.4);color:var(--success)}
 .toast.error{border-color:rgba(255,77,109,.4);color:var(--danger)}
+.search-input{width:100%;padding:12px 16px;border-radius:10px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-size:.9rem;margin-bottom:12px}
 </style></head><body>
 <header>
 <div class="logo">👑 Lux <span>VIP</span> Owner</div>
 <div class="nav-tabs">
 <button class="nav-tab active" onclick="tab('stats')">📊 إحصائيات</button>
+<button class="nav-tab" onclick="tab('charge')">💳 شحن</button>
 <button class="nav-tab" onclick="tab('users')">👥 المستخدمون</button>
 <button class="nav-tab" onclick="tab('tasks')">🎁 المهام</button>
 <button class="nav-tab" onclick="tab('pass')">🔑 كلمة المرور</button>
@@ -1616,13 +1822,27 @@ td{padding:10px 6px;border-bottom:1px solid rgba(255,255,255,.03)}
 <div class="stats" id="stats-box"><div class="stat"><div class="num">...</div><div class="lbl">جارٍ التحميل</div></div></div>
 </div>
 
+<div class="panel" id="p-charge">
+<h1>💳 شحن رصيد بتوكن</h1>
+<div class="charge-box">
+<h3>🎫 ابحث بالتوكن (LUX-XXXX-XXXX)</h3>
+<form class="charge-form" onsubmit="chargeByToken(event)">
+<input type="text" id="charge-token" placeholder="LUX-A3B5-C7D9" required style="text-transform:uppercase">
+<input type="number" id="charge-amount" placeholder="عدد النقاط" required>
+<button type="submit">💳 شحن</button>
+</form>
+<div id="charge-result" class="charge-result"></div>
+</div>
+</div>
+
 <div class="panel" id="p-users">
 <h1>👥 المستخدمون</h1>
+<input type="text" class="search-input" id="user-search" placeholder="🔍 ابحث بالتوكن أو ID..." oninput="renderUsers()">
 <div class="card" id="users-box">جارٍ التحميل...</div>
 </div>
 
 <div class="panel" id="p-tasks">
-<h1>🎁 إعدادات المهام والروابط</h1>
+<h1>🎁 إعدادات المهام</h1>
 <div class="card">
 <h3 style="margin-bottom:12px">💎 جوائز المهام</h3>
 <div class="form-group"><label>جائزة الزيارة اليومية</label><input type="number" class="form-input" id="t-daily" value="3"></div>
@@ -1630,7 +1850,7 @@ td{padding:10px 6px;border-bottom:1px solid rgba(255,255,255,.03)}
 <div class="form-group"><label>جائزة الدعوة</label><input type="number" class="form-input" id="t-invite" value="15"></div>
 </div>
 <div class="card">
-<h3 style="margin-bottom:12px">🔗 روابط الاشتراك</h3>
+<h3 style="margin-bottom:10px">🔗 روابط الاشتراك</h3>
 <p style="color:var(--muted);font-size:.78rem;margin-bottom:10px">كل رابط يمنح المستخدم النقاط عند الاشتراك</p>
 <div id="links-container"></div>
 <button class="btn btn-add" onclick="addLink()" style="margin-top:10px;padding:8px 16px">+ إضافة رابط</button>
@@ -1650,6 +1870,7 @@ td{padding:10px 6px;border-bottom:1px solid rgba(255,255,255,.03)}
 </main>
 <div class="toast" id="toast"></div>
 <script>
+let usersCache = [];
 function toast(m,t='success'){const el=document.getElementById('toast');el.textContent=m;el.className='toast show '+t;clearTimeout(el._t);el._t=setTimeout(()=>el.className='toast '+t,3000)}
 function tab(name){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
@@ -1674,19 +1895,48 @@ async function loadStats(){
   }catch(e){toast('فشل','error')}
 }
 
+async function chargeByToken(ev){
+  ev.preventDefault();
+  const token = document.getElementById('charge-token').value.trim();
+  const amount = parseInt(document.getElementById('charge-amount').value);
+  const res = document.getElementById('charge-result');
+  if(!token||!amount){res.className='charge-result err';res.textContent='❌ املأ الحقلين';return}
+  try{
+    const f=new FormData();f.append('user_token',token);f.append('amount',amount);
+    const r=await fetch('/api/owner/charge-by-token',{method:'POST',body:f});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.detail||'فشل');
+    res.className='charge-result ok';
+    res.textContent=`✅ تم! المستخدم ${d.user_token} — رصيده الآن ${d.new_credits} نقطة`;
+    document.getElementById('charge-token').value='';
+    document.getElementById('charge-amount').value='';
+  }catch(e){res.className='charge-result err';res.textContent='❌ '+e.message}
+}
+
 async function loadUsers(){
   try{
     const r=await fetch('/api/owner/users');const d=await r.json();
-    const el=document.getElementById('users-box');
-    if(!d.items.length){el.innerHTML='<div style="text-align:center;padding:20px;color:var(--muted)">لا مستخدمون</div>';return}
-    el.innerHTML=`<table><thead><tr><th>ID</th><th>IP</th><th>نقاط</th><th>عمليات</th><th>بادئة</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>${d.items.map(x=>`<tr>
-      <td class="mono">${x.id.slice(0,10)}</td><td style="color:var(--muted);font-size:.7rem">${x.ip}</td>
-      <td><strong style="color:var(--cyan)">${x.credits}</strong></td><td>${x.usage_count}</td>
-      <td class="mono">${x.prefix}</td>
-      <td>${x.is_banned?'<span style="color:var(--danger)">محظور</span>':'<span style="color:var(--success)">نشط</span>'}</td>
-      <td><button class="btn btn-add" onclick="addCred('${x.id}')">+ نقاط</button><button class="btn btn-ban" onclick="toggleBan('${x.id}',${!x.is_banned})">${x.is_banned?'فك':'حظر'}</button></td>
-    </tr>`).join('')}</tbody></table>`;
+    usersCache = d.items || [];
+    renderUsers();
   }catch(e){toast('فشل','error')}
+}
+function renderUsers(){
+  const q = (document.getElementById('user-search').value || '').toUpperCase();
+  const items = usersCache.filter(u =>
+    !q || (u.user_token||'').toUpperCase().includes(q) || String(u.id).toUpperCase().includes(q) || String(u.ip).includes(q)
+  );
+  const el=document.getElementById('users-box');
+  if(!items.length){el.innerHTML='<div style="text-align:center;padding:20px;color:var(--muted)">لا يوجد مستخدمون</div>';return}
+  el.innerHTML=`<table><thead><tr><th>التوكن</th><th>ID</th><th>IP</th><th>نقاط</th><th>عمليات</th><th>UA</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>${items.map(x=>`<tr>
+    <td><span class="token-cell">${x.user_token||'-'}</span></td>
+    <td class="mono">${x.id.slice(0,8)}</td>
+    <td style="color:var(--muted);font-size:.68rem">${x.ip}</td>
+    <td><strong style="color:var(--cyan)">${x.credits}</strong></td>
+    <td>${x.usage_count}</td>
+    <td style="color:var(--muted);font-size:.65rem;max-width:120px;overflow:hidden;text-overflow:ellipsis">${x.ua||'-'}</td>
+    <td>${x.is_banned?'<span style="color:var(--danger)">محظور</span>':'<span style="color:var(--success)">نشط</span>'}</td>
+    <td><button class="btn btn-add" onclick="addCred('${x.id}')">+ نقاط</button><button class="btn btn-ban" onclick="toggleBan('${x.id}',${!x.is_banned})">${x.is_banned?'فك':'حظر'}</button></td>
+  </tr>`).join('')}</tbody></table>`;
 }
 
 async function addCred(id){const v=prompt('عدد النقاط (سالب للخصم):');if(!v)return;const f=new FormData();f.append('user_id',id);f.append('amount',v);const r=await fetch('/api/owner/user/credits',{method:'POST',body:f});if(r.ok){toast('✅');loadUsers();loadStats()}else toast('❌','error')}
@@ -1704,12 +1954,12 @@ async function loadConfig(){
 }
 function renderLinks(){
   const el=document.getElementById('links-container');
-  if(!linksState.length){el.innerHTML='<p style="color:var(--muted);font-size:.8rem;padding:10px">لا توجد روابط بعد</p>';return}
+  if(!linksState.length){el.innerHTML='<p style="color:var(--muted);font-size:.8rem;padding:10px">لا روابط بعد</p>';return}
   el.innerHTML=linksState.map((lk,i)=>`<div class="link-row">
     <input class="form-input" value="${lk.icon||''}" onchange="linksState[${i}].icon=this.value" placeholder="إيموجي">
     <input class="form-input" value="${lk.title||''}" onchange="linksState[${i}].title=this.value" placeholder="العنوان">
     <input class="form-input" value="${lk.url||''}" onchange="linksState[${i}].url=this.value" placeholder="https://">
-    <input type="number" class="form-input" value="${lk.reward||10}" onchange="linksState[${i}].reward=+this.value" placeholder="نقاط">
+    <input type="number" class="form-input" value="${lk.reward||10}" onchange="linksState[${i}].reward=+this.value">
     <button class="btn btn-ban" onclick="linksState.splice(${i},1);renderLinks()">🗑️</button>
   </div>`).join('');
 }
@@ -1739,14 +1989,15 @@ loadStats();
 # ═══════════════════════════════════════════════════════════════════
 SVG_ICON = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#00e0ff"/><stop offset="0.5" stop-color="#7c5cff"/><stop offset="1" stop-color="#ff2d95"/></linearGradient></defs><rect width="512" height="512" rx="112" fill="#05070f"/><circle cx="256" cy="256" r="140" fill="none" stroke="url(#g)" stroke-width="20"/><path d="M200 320 L256 200 L312 320 Z" fill="url(#g)"/><circle cx="256" cy="180" r="22" fill="url(#g)"/></svg>"""
 
-SW_JS = """self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>self.clients.claim());self.addEventListener('fetch',e=>{if(e.request.method!=='GET')return;if(e.request.url.includes('/api/'))return;if(e.request.url.endsWith('/ping'))return;e.respondWith(caches.open('lux-v7').then(c=>fetch(e.request).then(r=>{if(r.ok&&r.type==='basic')c.put(e.request,r.clone());return r}).catch(()=>c.match(e.request))))});"""
+SW_JS = """self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>self.clients.claim());self.addEventListener('fetch',e=>{if(e.request.method!=='GET')return;if(e.request.url.includes('/api/'))return;if(e.request.url.endsWith('/ping'))return;e.respondWith(caches.open('lux-v8').then(c=>fetch(e.request).then(r=>{if(r.ok&&r.type==='basic')c.put(e.request,r.clone());return r}).catch(()=>c.match(e.request))))});"""
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  RUN
 # ═══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    print(f"👑 Lux Studio VIP v7 → port {PORT}", flush=True)
+    print(f"👑 Lux Studio VIP v8 → port {PORT}", flush=True)
     print(f"📦 DSS: {DSS_BASE_URL}", flush=True)
     print(f"🔐 Owner: /owner (password: {OWNER_PASSWORD})", flush=True)
+    print(f"⚡ Ping: /ping (never creates users)", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info", access_log=False)
