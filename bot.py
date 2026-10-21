@@ -1,18 +1,18 @@
 """
 ╔══════════════════════════════════════════════════════════════════════╗
-║  👑 LUX STUDIO VIP v6 — Complete Designer App                        ║
+║  👑 LUX STUDIO VIP v7 — Complete Designer App + Rewards              ║
 ║  ──────────────────────────────────────────────────────────────────  ║
-║  • Sidebar drawer navigation (9 pages)                               ║
-║  • 17 designer tools (remove-bg, enhance, crop, resize, filters...)  ║
-║  • API Keys page                                                     ║
-║  • Admin panel (password: xeon)                                      ║
-║  • PWA installable — feels like real APK                             ║
-║  • DSS database integrated                                           ║
+║  • Auto API key generation (no more "key missing")                   ║
+║  • 21 image tools                                                    ║
+║  • Tasks page: daily check-in, share, invite, subscribe links        ║
+║  • Owner panel: manage users, tasks, links, password                 ║
+║  • PWA installable                                                    ║
+║  • DSS database integrated                                            ║
 ╚══════════════════════════════════════════════════════════════════════╝
 """
 
 import os, sys, io, time, secrets, hashlib, logging, asyncio, contextlib
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from collections import defaultdict, Counter
 
@@ -28,14 +28,26 @@ import uvicorn
 # ═══════════════════════════════════════════════════════════════════
 DSS_BASE_URL = "https://kali-imvx.onrender.com"
 DSS_API_KEY  = "dss_SSiPIYB4EpWwVmfygQ1LTF2KymOjd-qxAQ4U3Q"
-ADMIN_PASSWORD = "xeon"
-ADMIN_SESSION_HOURS = 24
+OWNER_PASSWORD = "xeon"          # ← كلمة مرور المالك (صفحة /owner)
+OWNER_SESSION_HOURS = 24
 FREE_CREDITS = 30
 MAX_FILE_MB = 15
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
 PORT = int(os.getenv("PORT", "8000"))
 RATE_WINDOW = 60
 RATE_LIMIT = 40
+APP_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/") or f"http://localhost:{PORT}"
+
+# Default tasks config (can be overridden via /owner panel)
+DEFAULT_TASKS = {
+    "daily_checkin": {"reward": 3, "label": "زيارة يومية"},
+    "share_app": {"reward": 5, "label": "مشاركة التطبيق"},
+    "invite_friend": {"reward": 15, "label": "دعوة صديق"},
+}
+DEFAULT_LINKS = [
+    {"id": "t1", "title": "تابعنا على تيليجرام", "url": "https://t.me/telegram", "reward": 10, "icon": "✈️"},
+    {"id": "t2", "title": "قناتنا على واتساب", "url": "https://whatsapp.com", "reward": 10, "icon": "💬"},
+]
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s",
@@ -60,12 +72,9 @@ def _load_rembg_sync():
         from rembg import remove as rr, new_session
         _rembg_remove = rr
         try:
-            new_session(REMBG_MODEL)
-            log.info(f"✅ Model '{REMBG_MODEL}' ready")
-        except Exception as e:
-            log.warning(f"⚠️ preload: {e}")
-    except Exception as e:
-        log.error(f"❌ rembg: {e}")
+            new_session(REMBG_MODEL); log.info(f"✅ '{REMBG_MODEL}' ready")
+        except Exception as e: log.warning(f"⚠️ preload: {e}")
+    except Exception as e: log.error(f"❌ rembg: {e}")
     finally:
         _rembg_ready = True
         try: _rembg_event.set()
@@ -77,7 +86,6 @@ async def _ensure_rembg_loaded():
     async with _rembg_lock:
         if _rembg_ready: return
         await asyncio.to_thread(_load_rembg_sync)
-
 
 # ═══════════════════════════════════════════════════════════════════
 #  DSS CLIENT
@@ -95,8 +103,7 @@ class DSS:
         }
 
     async def _req(self, method: str, path: str, retries: int = 2, **kw):
-        url = f"{self.base}{path}"
-        last = None
+        url = f"{self.base}{path}"; last = None
         for attempt in range(retries + 1):
             try:
                 async with httpx.AsyncClient(timeout=60.0) as c:
@@ -106,17 +113,13 @@ class DSS:
             except httpx.HTTPStatusError as e:
                 body = e.response.text[:200] if e.response is not None else ""
                 last = DSSError(f"{method} {path} → {e.response.status_code}: {body}")
-                if 400 <= e.response.status_code < 500 and e.response.status_code != 404:
-                    raise last
-            except httpx.RequestError as e:
-                last = DSSError(f"net {method} {path}: {e}")
-            if attempt < retries:
-                await asyncio.sleep(0.6)
+                if 400 <= e.response.status_code < 500 and e.response.status_code != 404: raise last
+            except httpx.RequestError as e: last = DSSError(f"net {method} {path}: {e}")
+            if attempt < retries: await asyncio.sleep(0.6)
         raise last or DSSError("unknown")
 
     async def list(self, collection: str) -> list:
-        try:
-            res = await self._req("GET", f"/api/db/{collection}")
+        try: res = await self._req("GET", f"/api/db/{collection}")
         except DSSError as e:
             if "404" in str(e): return []
             raise
@@ -137,21 +140,14 @@ class DSS:
 
     async def update(self, collection: str, doc_id, data: dict) -> dict:
         for method in ("PATCH", "PUT"):
-            try:
-                return await self._req(method, f"/api/db/{collection}/{doc_id}", json=data)
+            try: return await self._req(method, f"/api/db/{collection}/{doc_id}", json=data)
             except DSSError: continue
-        try:
-            return await self._req("POST", f"/api/db/{collection}", json={**data, "id": doc_id})
-        except DSSError as e:
-            log.warning(f"update fallback: {e}")
-            return {}
+        try: return await self._req("POST", f"/api/db/{collection}", json={**data, "id": doc_id})
+        except DSSError as e: log.warning(f"update fallback: {e}"); return {}
 
     async def delete(self, collection: str, doc_id) -> bool:
-        try:
-            await self._req("DELETE", f"/api/db/{collection}/{doc_id}")
-            return True
-        except DSSError:
-            return False
+        try: await self._req("DELETE", f"/api/db/{collection}/{doc_id}"); return True
+        except DSSError: return False
 
     @staticmethod
     def doc_id(doc: dict):
@@ -164,41 +160,39 @@ class DSS:
 dss = DSS()
 
 # ═══════════════════════════════════════════════════════════════════
-#  RATE LIMITER + ADMIN SESSIONS
+#  RATE + OWNER SESSIONS
 # ═══════════════════════════════════════════════════════════════════
 _rate_buckets: dict = defaultdict(list)
-_admin_sessions: dict = {}
+_owner_sessions: dict = {}
 
 
 def rate_check(key: str) -> bool:
     now = time.time()
     _rate_buckets[key] = [t for t in _rate_buckets[key] if now - t < RATE_WINDOW]
     if len(_rate_buckets[key]) >= RATE_LIMIT: return False
-    _rate_buckets[key].append(now)
-    return True
+    _rate_buckets[key].append(now); return True
 
 
-def new_admin_session() -> str:
+def new_owner_session() -> str:
     token = secrets.token_urlsafe(32)
-    _admin_sessions[token] = time.time() + ADMIN_SESSION_HOURS * 3600
+    _owner_sessions[token] = time.time() + OWNER_SESSION_HOURS * 3600
     now = time.time()
-    for t in list(_admin_sessions.keys()):
-        if _admin_sessions[t] < now: _admin_sessions.pop(t, None)
+    for t in list(_owner_sessions.keys()):
+        if _owner_sessions[t] < now: _owner_sessions.pop(t, None)
     return token
 
 
-def check_admin_session(token: Optional[str]) -> bool:
+def check_owner(token: Optional[str]) -> bool:
     if not token: return False
-    exp = _admin_sessions.get(token)
+    exp = _owner_sessions.get(token)
     if not exp: return False
-    if exp < time.time():
-        _admin_sessions.pop(token, None); return False
+    if exp < time.time(): _owner_sessions.pop(token, None); return False
     return True
 
 
-def require_admin(lux_admin: Optional[str] = Cookie(None)):
-    if not check_admin_session(lux_admin):
-        raise HTTPException(401, "Admin session required")
+def require_owner(lux_owner: Optional[str] = Cookie(None)):
+    if not check_owner(lux_owner): raise HTTPException(401, "Owner session required")
+    return True
 
 # ═══════════════════════════════════════════════════════════════════
 #  USERS
@@ -208,16 +202,14 @@ def sha256(s: str) -> str: return hashlib.sha256(s.encode()).hexdigest()
 
 async def get_user_by_id(uid: str) -> Optional[dict]:
     for u in await dss.list("users"):
-        if str(u.get("id")) == str(uid) or str(u.get("_id")) == str(uid):
-            return u
+        if str(u.get("id")) == str(uid) or str(u.get("_id")) == str(uid): return u
     return None
 
 
 async def find_api_key(plain: str) -> Optional[dict]:
     target = sha256(plain.strip())
     try: keys = await dss.list("api_keys")
-    except DSSError as e:
-        log.error(f"find_api_key: {e}"); return None
+    except DSSError as e: log.error(f"find_api_key: {e}"); return None
     for k in keys:
         if k.get("hash") == target and k.get("active", True): return k
     return None
@@ -237,13 +229,16 @@ async def ip_key_count(ip: str) -> int:
     return count
 
 
-async def create_free_key(ip: str) -> dict:
+async def create_free_key(ip: str, invite_code: str = "") -> dict:
     user_id = secrets.token_urlsafe(12)
-    await dss.create("users", {
+    user_doc = {
         "id": user_id, "ip": ip, "credits": FREE_CREDITS,
         "usage_count": 0, "is_banned": False,
+        "invite_code": secrets.token_urlsafe(8),
+        "invited_by": invite_code or "",
         "created_at": datetime.now(timezone.utc).isoformat(),
-    })
+    }
+    await dss.create("users", user_doc)
     plain = f"lux_{secrets.token_urlsafe(32)}"
     prefix = plain[:12]
     await dss.create("api_keys", {
@@ -251,7 +246,20 @@ async def create_free_key(ip: str) -> dict:
         "hash": sha256(plain), "prefix": prefix, "active": True,
         "created_at": datetime.now(timezone.utc).isoformat(),
     })
-    return {"api_key": plain, "prefix": prefix, "credits": FREE_CREDITS, "user_id": user_id}
+    # Handle invite reward
+    if invite_code:
+        try:
+            for u in await dss.list("users"):
+                if u.get("invite_code") == invite_code and str(u.get("id")) != user_id:
+                    did = DSS.doc_id(u)
+                    if did is not None:
+                        await dss.update("users", did, {
+                            "credits": int(u.get("credits", 0)) + DEFAULT_TASKS["invite_friend"]["reward"],
+                        })
+                    break
+        except: pass
+    return {"api_key": plain, "prefix": prefix, "credits": FREE_CREDITS,
+            "user_id": user_id, "invite_code": user_doc["invite_code"]}
 
 
 async def deduct_credit(user_id: str) -> bool:
@@ -300,294 +308,264 @@ async def authenticate(x_api_key: Optional[str]) -> dict:
     return rec
 
 # ═══════════════════════════════════════════════════════════════════
-#  IMAGE TOOLS (17 tools)
+#  TASKS CONFIG
 # ═══════════════════════════════════════════════════════════════════
-def _open_image(data: bytes) -> Image.Image:
+async def get_tasks_config() -> dict:
+    try:
+        for doc in await dss.list("app_config"):
+            if doc.get("id") == "tasks" or doc.get("_id") == "tasks":
+                return {
+                    "daily_checkin": doc.get("daily_checkin", DEFAULT_TASKS["daily_checkin"]),
+                    "share_app": doc.get("share_app", DEFAULT_TASKS["share_app"]),
+                    "invite_friend": doc.get("invite_friend", DEFAULT_TASKS["invite_friend"]),
+                    "links": doc.get("links", DEFAULT_LINKS),
+                }
+    except: pass
+    return {**DEFAULT_TASKS, "links": DEFAULT_LINKS}
+
+
+async def save_tasks_config(cfg: dict) -> bool:
+    try:
+        existing = None
+        for doc in await dss.list("app_config"):
+            if doc.get("id") == "tasks" or doc.get("_id") == "tasks":
+                existing = doc; break
+        if existing:
+            did = DSS.doc_id(existing)
+            if did is not None:
+                await dss.update("app_config", did, cfg)
+        else:
+            await dss.create("app_config", {"id": "tasks", **cfg})
+        return True
+    except Exception as e:
+        log.error(f"save_tasks_config: {e}")
+        return False
+
+
+async def get_user_claims(user_id: str) -> list:
+    try:
+        return [c for c in await dss.list("user_tasks") if c.get("user_id") == user_id]
+    except: return []
+
+
+async def log_claim(user_id: str, task_id: str):
+    await dss.create("user_tasks", {
+        "id": secrets.token_urlsafe(12),
+        "user_id": user_id, "task_id": task_id,
+        "claimed_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+# ═══════════════════════════════════════════════════════════════════
+#  IMAGE TOOLS (21 tools — compact)
+# ═══════════════════════════════════════════════════════════════════
+def _open(data: bytes) -> Image.Image:
     try:
         img = Image.open(io.BytesIO(data)); img.load(); return img
-    except Exception as e:
-        raise ValueError(f"Invalid image: {e}")
+    except Exception as e: raise ValueError(f"Invalid: {e}")
 
 
-def _save(img: Image.Image, fmt: str = "PNG", **kw) -> bytes:
+def _save(img: Image.Image, fmt="PNG", **kw) -> bytes:
     out = io.BytesIO(); img.save(out, format=fmt, **kw); return out.getvalue()
 
 
-def t_remove_bg(data: bytes) -> tuple:
-    if _rembg_remove is None: raise RuntimeError("Model loading... retry in 30s")
-    try: result = _rembg_remove(data, model_name=REMBG_MODEL)
-    except: result = _rembg_remove(data)
-    return result, "image/png", "png"
+def t_remove_bg(d, **kw):
+    if _rembg_remove is None: raise RuntimeError("Model loading")
+    try: return _rembg_remove(d, model_name=REMBG_MODEL), "image/png", "png"
+    except: return _rembg_remove(d), "image/png", "png"
 
 
-def t_enhance(data: bytes) -> tuple:
-    img = _open_image(data)
-    has_alpha = img.mode in ("RGBA","LA") or (img.mode == "P" and "transparency" in img.info)
-    img = img.convert("RGBA" if has_alpha else "RGB")
-    w, h = img.size
-    nw, nh = w * 2, h * 2
-    if max(nw, nh) > 2048:
-        r = 2048 / max(nw, nh); nw, nh = int(nw * r), int(nh * r)
+def t_enhance(d, **kw):
+    img = _open(d)
+    a = img.mode in ("RGBA","LA") or (img.mode == "P" and "transparency" in img.info)
+    img = img.convert("RGBA" if a else "RGB")
+    w, h = img.size; nw, nh = w * 2, h * 2
+    if max(nw, nh) > 2048: r = 2048 / max(nw, nh); nw, nh = int(nw*r), int(nh*r)
     img = img.resize((nw, nh), Image.Resampling.LANCZOS)
     img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=150, threshold=3))
     img = ImageEnhance.Sharpness(img).enhance(1.4)
     img = ImageEnhance.Contrast(img).enhance(1.12)
     img = ImageEnhance.Color(img).enhance(1.18)
-    if has_alpha: return _save(img, "PNG", optimize=True), "image/png", "png"
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+    return (_save(img, "PNG", optimize=True), "image/png", "png") if a else (_save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg")
 
 
-def t_compress(data: bytes, quality: int = 75) -> tuple:
-    img = _open_image(data)
-    q = max(10, min(95, quality))
-    if img.mode not in ("RGB","RGBA"):
-        img = img.convert("RGBA" if img.mode in ("P","LA") else "RGB")
-    if img.mode == "RGBA": return _save(img, "PNG", optimize=True), "image/png", "png"
-    return _save(img, "JPEG", quality=q, optimize=True), "image/jpeg", "jpg"
+def t_compress(d, quality=75, **kw):
+    img = _open(d)
+    if img.mode not in ("RGB","RGBA"): img = img.convert("RGBA" if img.mode in ("P","LA") else "RGB")
+    q = max(10, min(95, int(quality)))
+    return (_save(img, "PNG", optimize=True), "image/png", "png") if img.mode == "RGBA" else (_save(img, "JPEG", quality=q, optimize=True), "image/jpeg", "jpg")
 
 
-def t_convert(data: bytes, target: str = "png") -> tuple:
-    img = _open_image(data); target = target.lower()
-    if target not in ("jpg","jpeg","png","webp"): raise ValueError(f"Unsupported: {target}")
+def t_convert(d, target="png", **kw):
+    img = _open(d); target = target.lower()
     if target in ("jpg","jpeg"):
         if img.mode != "RGB": img = img.convert("RGB")
         return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
     elif target == "png":
-        if img.mode not in ("RGBA","RGB"):
-            img = img.convert("RGBA" if "transparency" in img.info else "RGB")
+        if img.mode not in ("RGBA","RGB"): img = img.convert("RGBA" if "transparency" in img.info else "RGB")
         return _save(img, "PNG", optimize=True), "image/png", "png"
     else:
         if img.mode not in ("RGB","RGBA"): img = img.convert("RGB")
         return _save(img, "WEBP", quality=90, method=6), "image/webp", "webp"
 
 
-def t_grayscale(data: bytes) -> tuple:
-    img = _open_image(data)
+def t_grayscale(d, **kw):
+    img = _open(d)
     if img.mode in ("RGBA","LA"):
-        alpha = img.split()[-1]
-        gray = ImageOps.grayscale(img.convert("RGB")).convert("RGBA")
-        gray.putalpha(alpha); img = gray
-    else: img = ImageOps.grayscale(img.convert("RGB"))
-    if img.mode == "RGBA": return _save(img, "PNG", optimize=True), "image/png", "png"
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+        a = img.split()[-1]; g = ImageOps.grayscale(img.convert("RGB")).convert("RGBA"); g.putalpha(a)
+        return _save(g, "PNG", optimize=True), "image/png", "png"
+    return _save(ImageOps.grayscale(img.convert("RGB")), "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
 
 
-def t_sepia(data: bytes) -> tuple:
-    img = _open_image(data).convert("RGB")
-    pixels = img.load(); w, h = img.size
-    for y in range(h):
-        for x in range(w):
-            r, g, b = pixels[x, y]
-            tr = int(0.393*r + 0.769*g + 0.189*b)
-            tg = int(0.349*r + 0.686*g + 0.168*b)
-            tb = int(0.272*r + 0.534*g + 0.131*b)
-            pixels[x, y] = (min(255,tr), min(255,tg), min(255,tb))
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
-
-
-def t_invert(data: bytes) -> tuple:
-    img = _open_image(data)
+def t_invert(d, **kw):
+    img = _open(d)
     if img.mode == "RGBA":
-        r, g, b, a = img.split()
-        inv = ImageOps.invert(Image.merge("RGB", (r, g, b)))
-        r2, g2, b2 = inv.split()
-        img = Image.merge("RGBA", (r2, g2, b2, a))
-        return _save(img, "PNG", optimize=True), "image/png", "png"
-    img = img.convert("RGB")
-    return _save(ImageOps.invert(img), "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+        r, g, b, a = img.split(); inv = ImageOps.invert(Image.merge("RGB", (r,g,b)))
+        return _save(Image.merge("RGBA", (*inv.split(), a)), "PNG", optimize=True), "image/png", "png"
+    return _save(ImageOps.invert(img.convert("RGB")), "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
 
 
-def t_rotate(data: bytes, angle: int = 90) -> tuple:
-    img = _open_image(data); angle = angle % 360
+def t_rotate(d, angle=90, **kw):
+    img = _open(d); angle = int(angle) % 360
     img = img.rotate(-angle, expand=True, fillcolor=(0,0,0,0) if img.mode == "RGBA" else None)
-    if img.mode == "RGBA": return _save(img, "PNG", optimize=True), "image/png", "png"
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+    return (_save(img, "PNG", optimize=True), "image/png", "png") if img.mode == "RGBA" else (_save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg")
 
 
-def t_flip(data: bytes, direction: str = "h") -> tuple:
-    img = _open_image(data)
+def t_flip(d, direction="h", **kw):
+    img = _open(d)
     img = img.transpose(Image.Transpose.FLIP_LEFT_RIGHT if direction == "h" else Image.Transpose.FLIP_TOP_BOTTOM)
-    if img.mode == "RGBA": return _save(img, "PNG", optimize=True), "image/png", "png"
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+    return (_save(img, "PNG", optimize=True), "image/png", "png") if img.mode == "RGBA" else (_save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg")
 
 
-def t_blur(data: bytes, radius: int = 5) -> tuple:
-    img = _open_image(data)
-    r = max(1, min(30, radius))
+def t_blur(d, radius=5, **kw):
+    img = _open(d); r = max(1, min(30, int(radius)))
     img = img.filter(ImageFilter.GaussianBlur(radius=r))
-    if img.mode == "RGBA": return _save(img, "PNG", optimize=True), "image/png", "png"
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+    return (_save(img, "PNG", optimize=True), "image/png", "png") if img.mode == "RGBA" else (_save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg")
 
 
-def t_sharpen(data: bytes) -> tuple:
-    img = _open_image(data)
+def t_sharpen(d, **kw):
+    img = _open(d)
     img = img.filter(ImageFilter.UnsharpMask(radius=2, percent=200, threshold=2))
     img = ImageEnhance.Sharpness(img).enhance(1.8)
-    if img.mode == "RGBA": return _save(img, "PNG", optimize=True), "image/png", "png"
-    return _save(img, "JPEG", quality=95, optimize=True), "image/jpeg", "jpg"
+    return (_save(img, "PNG", optimize=True), "image/png", "png") if img.mode == "RGBA" else (_save(img, "JPEG", quality=95, optimize=True), "image/jpeg", "jpg")
 
 
-def t_vintage(data: bytes) -> tuple:
-    img = _open_image(data).convert("RGB")
+def _filter_color(d, r_mul=1, g_mul=1, b_mul=1, sat=1):
+    img = _open(d).convert("RGB")
+    if sat != 1: img = ImageEnhance.Color(img).enhance(sat)
+    r, g, b = img.split()
+    r = r.point(lambda i: min(255, int(i * r_mul)))
+    g = g.point(lambda i: min(255, int(i * g_mul)))
+    b = b.point(lambda i: min(255, int(i * b_mul)))
+    img = Image.merge("RGB", (r, g, b))
+    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+
+
+def t_warm(d, **kw): return _filter_color(d, 1.15, 1.02, 0.88)
+def t_cool(d, **kw): return _filter_color(d, 0.88, 1.02, 1.15)
+def t_vintage(d, **kw):
+    img = _open(d).convert("RGB")
     img = ImageEnhance.Color(img).enhance(0.6)
     img = ImageEnhance.Contrast(img).enhance(1.1)
+    r, g, b = img.split()
+    r = r.point(lambda i: min(255, i + 15)); b = b.point(lambda i: max(0, i - 15))
+    return _save(Image.merge("RGB", (r, g, b)), "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+
+
+def t_sepia(d, **kw):
+    img = _open(d).convert("RGB"); px = img.load(); w, h = img.size
+    for y in range(h):
+        for x in range(w):
+            r, g, b = px[x, y]
+            px[x, y] = (min(255, int(0.393*r+0.769*g+0.189*b)),
+                        min(255, int(0.349*r+0.686*g+0.168*b)),
+                        min(255, int(0.272*r+0.534*g+0.131*b)))
+    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+
+
+def t_adjust(d, brightness=0, contrast=0, saturation=0, **kw):
+    img = _open(d); a = img.mode in ("RGBA","LA")
+    alpha = img.split()[-1] if a else None
     img = img.convert("RGB")
-    r, g, b = img.split()
-    r = r.point(lambda i: min(255, i + 15))
-    b = b.point(lambda i: max(0, i - 15))
-    img = Image.merge("RGB", (r, g, b))
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
-
-
-def t_warm(data: bytes) -> tuple:
-    img = _open_image(data).convert("RGB")
-    r, g, b = img.split()
-    r = r.point(lambda i: min(255, i + 20))
-    b = b.point(lambda i: max(0, i - 20))
-    img = Image.merge("RGB", (r, g, b))
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
-
-
-def t_cool(data: bytes) -> tuple:
-    img = _open_image(data).convert("RGB")
-    r, g, b = img.split()
-    r = r.point(lambda i: max(0, i - 20))
-    b = b.point(lambda i: min(255, i + 20))
-    img = Image.merge("RGB", (r, g, b))
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
-
-
-def t_adjust(data: bytes, brightness: int = 0, contrast: int = 0, saturation: int = 0) -> tuple:
-    img = _open_image(data)
-    has_alpha = img.mode in ("RGBA","LA")
-    if has_alpha:
-        alpha = img.split()[-1] if img.mode == "RGBA" else None
-        img = img.convert("RGB")
-    else:
-        img = img.convert("RGB")
-    b_factor = 1.0 + brightness / 100.0
-    c_factor = 1.0 + contrast / 100.0
-    s_factor = 1.0 + saturation / 100.0
-    img = ImageEnhance.Brightness(img).enhance(max(0.1, b_factor))
-    img = ImageEnhance.Contrast(img).enhance(max(0.1, c_factor))
-    img = ImageEnhance.Color(img).enhance(max(0.0, s_factor))
-    if has_alpha:
-        r, g, b = img.split()
-        img = Image.merge("RGBA", (r, g, b, alpha)) if alpha else img.convert("RGBA")
+    img = ImageEnhance.Brightness(img).enhance(max(0.1, 1 + int(brightness)/100))
+    img = ImageEnhance.Contrast(img).enhance(max(0.1, 1 + int(contrast)/100))
+    img = ImageEnhance.Color(img).enhance(max(0.0, 1 + int(saturation)/100))
+    if a and alpha:
+        img = Image.merge("RGBA", (*img.split(), alpha))
         return _save(img, "PNG", optimize=True), "image/png", "png"
     return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
 
 
-def t_resize(data: bytes, width: int = 0, height: int = 0) -> tuple:
-    img = _open_image(data)
-    w, h = img.size
-    if width <= 0 and height <= 0: raise ValueError("Specify width or height")
-    if width > 0 and height > 0:
-        nw, nh = width, height
-    elif width > 0:
-        nw = width; nh = int(h * width / w)
-    else:
-        nh = height; nw = int(w * height / h)
+def t_resize(d, width=0, height=0, **kw):
+    img = _open(d); w, h = img.size
+    width, height = int(width), int(height)
+    if width <= 0 and height <= 0: raise ValueError("Specify width/height")
+    if width > 0 and height > 0: nw, nh = width, height
+    elif width > 0: nw, nh = width, int(h*width/w)
+    else: nh, nw = height, int(w*height/h)
     nw, nh = min(nw, 4096), min(nh, 4096)
     img = img.resize((nw, nh), Image.Resampling.LANCZOS)
-    if img.mode == "RGBA": return _save(img, "PNG", optimize=True), "image/png", "png"
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+    return (_save(img, "PNG", optimize=True), "image/png", "png") if img.mode == "RGBA" else (_save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg")
 
 
-def t_crop(data: bytes, ratio: str = "1:1") -> tuple:
-    img = _open_image(data); w, h = img.size
+def t_crop(d, ratio="1:1", **kw):
+    img = _open(d); w, h = img.size
     try: rw, rh = map(int, ratio.split(":"))
     except: rw, rh = 1, 1
-    target_ratio = rw / rh
-    current = w / h
-    if current > target_ratio:
-        nh = h; nw = int(h * target_ratio); x, y = (w - nw) // 2, 0
-    else:
-        nw = w; nh = int(w / target_ratio); x, y = 0, (h - nh) // 2
-    img = img.crop((x, y, x + nw, y + nh))
-    if img.mode == "RGBA": return _save(img, "PNG", optimize=True), "image/png", "png"
-    return _save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+    tr = rw/rh; cur = w/h
+    if cur > tr: nh = h; nw = int(h*tr); x, y = (w-nw)//2, 0
+    else: nw = w; nh = int(w/tr); x, y = 0, (h-nh)//2
+    img = img.crop((x, y, x+nw, y+nh))
+    return (_save(img, "PNG", optimize=True), "image/png", "png") if img.mode == "RGBA" else (_save(img, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg")
 
 
-def t_watermark(data: bytes, text: str = "Lux Studio", position: str = "br", opacity: int = 60) -> tuple:
-    img = _open_image(data).convert("RGBA")
-    txt_layer = Image.new("RGBA", img.size, (0,0,0,0))
-    draw = ImageDraw.Draw(txt_layer)
-    font = None
-    try: font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(20, img.width // 20))
+def t_watermark(d, text="Lux Studio", position="br", opacity=60, **kw):
+    img = _open(d).convert("RGBA")
+    layer = Image.new("RGBA", img.size, (0,0,0,0))
+    draw = ImageDraw.Draw(layer)
+    try: font = ImageFont.truetype("DejaVuSans-Bold.ttf", max(20, img.width//20))
     except: font = ImageFont.load_default()
-    bbox = draw.textbbox((0,0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    margin = 20
-    positions = {
-        "tl": (margin, margin),
-        "tr": (img.width - tw - margin, margin),
-        "bl": (margin, img.height - th - margin),
-        "br": (img.width - tw - margin, img.height - th - margin),
-        "c": ((img.width - tw) // 2, (img.height - th) // 2),
-    }
-    pos = positions.get(position, positions["br"])
-    draw.text(pos, text, font=font, fill=(255, 255, 255, int(255 * opacity / 100)))
-    out = Image.alpha_composite(img, txt_layer)
-    return _save(out, "PNG", optimize=True), "image/png", "png"
+    bbox = draw.textbbox((0,0), text, font=font); tw, th = bbox[2]-bbox[0], bbox[3]-bbox[1]
+    m = 20
+    pos = {"tl":(m,m), "tr":(img.width-tw-m,m), "bl":(m,img.height-th-m),
+           "br":(img.width-tw-m,img.height-th-m), "c":((img.width-tw)//2,(img.height-th)//2)}.get(position, (img.width-tw-m, img.height-th-m))
+    draw.text(pos, text, font=font, fill=(255,255,255,int(255*int(opacity)/100)))
+    return _save(Image.alpha_composite(img, layer), "PNG", optimize=True), "image/png", "png"
 
 
-def t_bg_color(data: bytes, color: str = "#ffffff") -> tuple:
-    img = _open_image(data).convert("RGBA")
-    hex_c = color.lstrip("#")
-    try:
-        r, g, b = int(hex_c[0:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16)
+def t_bg_color(d, color="#ffffff", **kw):
+    img = _open(d).convert("RGBA")
+    hx = color.lstrip("#")
+    try: r, g, b = int(hx[0:2],16), int(hx[2:4],16), int(hx[4:6],16)
     except: r, g, b = 255, 255, 255
-    bg = Image.new("RGBA", img.size, (r, g, b, 255))
-    out = Image.alpha_composite(bg, img)
-    return _save(out.convert("RGB"), "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+    bg = Image.new("RGBA", img.size, (r,g,b,255))
+    return _save(Image.alpha_composite(bg, img).convert("RGB"), "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
 
 
-def t_round_corners(data: bytes, radius: int = 40) -> tuple:
-    img = _open_image(data).convert("RGBA")
-    w, h = img.size
-    radius = min(radius, min(w, h) // 2)
+def t_round_corners(d, radius=40, **kw):
+    img = _open(d).convert("RGBA"); w, h = img.size
+    radius = min(int(radius), min(w,h)//2)
     mask = Image.new("L", (w, h), 0)
-    ImageDraw.Draw(mask).rounded_rectangle((0, 0, w, h), radius=radius, fill=255)
+    ImageDraw.Draw(mask).rounded_rectangle((0,0,w,h), radius=radius, fill=255)
     img.putalpha(mask)
     return _save(img, "PNG", optimize=True), "image/png", "png"
 
 
-def t_border(data: bytes, thickness: int = 20, color: str = "#00e0ff") -> tuple:
-    img = _open_image(data)
-    has_alpha = img.mode == "RGBA"
-    if not has_alpha: img = img.convert("RGB")
-    hex_c = color.lstrip("#")
-    try: rgb = (int(hex_c[0:2],16), int(hex_c[2:4],16), int(hex_c[4:6],16))
-    except: rgb = (0, 224, 255)
-    out = ImageOps.expand(img, border=thickness, fill=rgb if not has_alpha else (*rgb, 255))
-    if out.mode == "RGBA": return _save(out, "PNG", optimize=True), "image/png", "png"
-    return _save(out, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg"
+def t_border(d, thickness=20, color="#00e0ff", **kw):
+    img = _open(d); hx = color.lstrip("#")
+    try: rgb = (int(hx[0:2],16), int(hx[2:4],16), int(hx[4:6],16))
+    except: rgb = (0,224,255)
+    fill = (*rgb, 255) if img.mode == "RGBA" else rgb
+    out = ImageOps.expand(img, border=int(thickness), fill=fill)
+    return (_save(out, "PNG", optimize=True), "image/png", "png") if out.mode == "RGBA" else (_save(out, "JPEG", quality=92, optimize=True), "image/jpeg", "jpg")
 
 
-# Registry
 TOOLS = {
-    "remove-bg": {"fn": t_remove_bg, "label": "إزالة الخلفية", "icon": "🖼️", "desc": "خلفية شفافة في ثوانٍ"},
-    "enhance": {"fn": t_enhance, "label": "تحسين", "icon": "✨", "desc": "تكبير ×2 + حدة + ألوان"},
-    "compress": {"fn": t_compress, "label": "ضغط", "icon": "📉", "desc": "حجم أصغر، جودة عالية"},
-    "convert": {"fn": t_convert, "label": "تحويل", "icon": "🔄", "desc": "PNG / JPG / WEBP"},
-    "grayscale": {"fn": t_grayscale, "label": "رمادي", "icon": "⚫", "desc": "أبيض وأسود احترافي"},
-    "sepia": {"fn": t_sepia, "label": "سيبيا", "icon": "🌅", "desc": "لون عتيق دافئ"},
-    "invert": {"fn": t_invert, "label": "انعكاس", "icon": "🌗", "desc": "ألوان معكوسة"},
-    "rotate": {"fn": t_rotate, "label": "تدوير", "icon": "🔃", "desc": "0° / 90° / 180° / 270°"},
-    "flip": {"fn": t_flip, "label": "قلب", "icon": "↔️", "desc": "أفقي أو رأسي"},
-    "blur": {"fn": t_blur, "label": "بلور", "icon": "💨", "desc": "تنعيم الخلفية"},
-    "sharpen": {"fn": t_sharpen, "label": "حدّة", "icon": "🔪", "desc": "تفاصيل أوضح"},
-    "vintage": {"fn": t_vintage, "label": "فينتاج", "icon": "📷", "desc": "فلتر كلاسيكي"},
-    "warm": {"fn": t_warm, "label": "دافئ", "icon": "☀️", "desc": "ألوان حمراء دافئة"},
-    "cool": {"fn": t_cool, "label": "بارد", "icon": "❄️", "desc": "ألوان زرقاء باردة"},
-    "adjust": {"fn": t_adjust, "label": "ضبط", "icon": "🎚️", "desc": "سطوع/تباين/تشبع"},
-    "resize": {"fn": t_resize, "label": "تحجيم", "icon": "📐", "desc": "أبعاد مخصصة"},
-    "crop": {"fn": t_crop, "label": "قص", "icon": "✂️", "desc": "نسبة عرض/ارتفاع"},
-    "watermark": {"fn": t_watermark, "label": "علامة مائية", "icon": "💧", "desc": "نص فوق الصورة"},
-    "bg-color": {"fn": t_bg_color, "label": "خلفية لون", "icon": "🎨", "desc": "بديل شفاف"},
-    "round-corners": {"fn": t_round_corners, "label": "زوايا دائرية", "icon": "⭕", "desc": "شكل أنيق"},
-    "border": {"fn": t_border, "label": "إطار", "icon": "🖼️", "desc": "حدود ملونة"},
+    "remove-bg": t_remove_bg, "enhance": t_enhance, "compress": t_compress, "convert": t_convert,
+    "grayscale": t_grayscale, "invert": t_invert, "rotate": t_rotate, "flip": t_flip,
+    "blur": t_blur, "sharpen": t_sharpen, "warm": t_warm, "cool": t_cool,
+    "vintage": t_vintage, "sepia": t_sepia, "adjust": t_adjust, "resize": t_resize,
+    "crop": t_crop, "watermark": t_watermark, "bg-color": t_bg_color,
+    "round-corners": t_round_corners, "border": t_border,
 }
 
 # ═══════════════════════════════════════════════════════════════════
@@ -599,8 +577,7 @@ async def _keep_alive():
     while True:
         await asyncio.sleep(600)
         try:
-            async with httpx.AsyncClient(timeout=20.0) as c:
-                await c.get(f"{url}/ping")
+            async with httpx.AsyncClient(timeout=20.0) as c: await c.get(f"{url}/ping")
         except: pass
 
 
@@ -608,7 +585,7 @@ async def _keep_alive():
 async def lifespan(app):
     bg = asyncio.create_task(_ensure_rembg_loaded())
     ka = asyncio.create_task(_keep_alive())
-    log.info("🚀 Lux Studio VIP v6 ready")
+    log.info("🚀 Lux Studio VIP v7 ready")
     try: yield
     finally:
         for t in (bg, ka): t.cancel()
@@ -618,7 +595,7 @@ async def lifespan(app):
 # ═══════════════════════════════════════════════════════════════════
 #  FASTAPI
 # ═══════════════════════════════════════════════════════════════════
-app = FastAPI(title="Lux Studio VIP", version="6.0.0", lifespan=lifespan)
+app = FastAPI(title="Lux Studio VIP", version="7.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 
@@ -636,7 +613,7 @@ async def manifest():
         "name": "Lux Studio VIP", "short_name": "Lux VIP", "start_url": "/",
         "display": "standalone", "orientation": "portrait-primary",
         "background_color": "#05070f", "theme_color": "#00e0ff",
-        "description": "17 أداة مصمم احترافية",
+        "description": "21 أداة مصمم + مهام + جوائز",
         "icons": [{"src": "/icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable"}],
     })
 
@@ -651,7 +628,7 @@ async def sw(): return Response(content=SW_JS, media_type="application/javascrip
 
 @app.get("/api/health")
 async def health():
-    r = {"status": "ok", "rembg_ready": _rembg_ready, "version": "6.0.0"}
+    r = {"status": "ok", "rembg_ready": _rembg_ready, "version": "7.0.0"}
     try:
         users = await dss.list("users"); r["dss"] = "connected"; r["dss_users"] = len(users)
     except Exception as e:
@@ -659,14 +636,14 @@ async def health():
     return r
 
 
-# ─── Keys ───
+# ─── Keys (auto-create supported) ───
 @app.post("/api/keys/new")
-async def api_new_key(request: Request):
+async def api_new_key(request: Request, invite: str = ""):
     ip = request.client.host if request.client else "unknown"
     if not rate_check(f"key:{ip}"): raise HTTPException(429, "Too many attempts")
     try:
         if await ip_key_count(ip) >= 3: raise HTTPException(429, "Max 3 keys/day")
-        return {**await create_free_key(ip), "message": "Save this key now"}
+        return {**await create_free_key(ip, invite), "message": "Save this key"}
     except HTTPException: raise
     except DSSError as e: raise HTTPException(503, f"DB: {e}")
 
@@ -682,6 +659,7 @@ async def api_me(x_api_key: Optional[str] = Header(None)):
         "prefix": rec.get("prefix"), "credits": int(user.get("credits", 0)),
         "total_operations": len(logs),
         "successful": sum(1 for l in logs if l.get("status") == "success"),
+        "invite_code": user.get("invite_code", ""),
         "created_at": user.get("created_at"),
     }
 
@@ -696,82 +674,151 @@ async def api_history(x_api_key: Optional[str] = Header(None)):
     except: return {"items": []}
 
 
+# ─── Tasks ───
+@app.get("/api/tasks")
+async def api_tasks(x_api_key: Optional[str] = Header(None)):
+    rec = await authenticate(x_api_key)
+    uid = rec["user_id"]
+    cfg = await get_tasks_config()
+    claims = await get_user_claims(uid)
+    claimed_ids = [c.get("task_id") for c in claims]
+
+    now = datetime.now(timezone.utc)
+    daily_claimed = False
+    for c in claims:
+        if c.get("task_id") == "daily_checkin":
+            try:
+                ts = datetime.fromisoformat(str(c.get("claimed_at","")).replace("Z","+00:00"))
+                if (now - ts).total_seconds() < 86400: daily_claimed = True
+            except: pass
+
+    return {
+        "daily_checkin": {**cfg["daily_checkin"], "claimed": daily_claimed},
+        "share_app": {**cfg["share_app"], "claimed": "share_app" in claimed_ids},
+        "invite_friend": {**cfg["invite_friend"], "claimed": "invite_friend" in claimed_ids},
+        "links": [{**lk, "claimed": f"link:{lk['id']}" in claimed_ids} for lk in cfg["links"]],
+    }
+
+
+@app.post("/api/tasks/checkin")
+async def api_checkin(x_api_key: Optional[str] = Header(None)):
+    rec = await authenticate(x_api_key)
+    uid = rec["user_id"]
+    claims = await get_user_claims(uid)
+    now = datetime.now(timezone.utc)
+    for c in claims:
+        if c.get("task_id") == "daily_checkin":
+            try:
+                ts = datetime.fromisoformat(str(c.get("claimed_at","")).replace("Z","+00:00"))
+                if (now - ts).total_seconds() < 86400:
+                    raise HTTPException(400, "Already claimed today")
+            except HTTPException: raise
+            except: pass
+    cfg = await get_tasks_config()
+    reward = cfg["daily_checkin"]["reward"]
+    await add_credits(uid, reward)
+    await log_claim(uid, "daily_checkin")
+    return {"ok": True, "reward": reward, "message": f"+{reward} نقطة!"}
+
+
+@app.post("/api/tasks/share")
+async def api_share(x_api_key: Optional[str] = Header(None)):
+    rec = await authenticate(x_api_key)
+    uid = rec["user_id"]
+    claims = await get_user_claims(uid)
+    if "share_app" in [c.get("task_id") for c in claims]:
+        raise HTTPException(400, "Already claimed")
+    cfg = await get_tasks_config()
+    reward = cfg["share_app"]["reward"]
+    await add_credits(uid, reward)
+    await log_claim(uid, "share_app")
+    return {"ok": True, "reward": reward, "message": f"+{reward} نقطة!"}
+
+
+@app.post("/api/tasks/claim-link")
+async def api_claim_link(link_id: str = Form(...), x_api_key: Optional[str] = Header(None)):
+    rec = await authenticate(x_api_key)
+    uid = rec["user_id"]
+    cfg = await get_tasks_config()
+    link = next((lk for lk in cfg["links"] if lk["id"] == link_id), None)
+    if not link: raise HTTPException(404, "Link not found")
+    claims = await get_user_claims(uid)
+    if f"link:{link_id}" in [c.get("task_id") for c in claims]:
+        raise HTTPException(400, "Already claimed")
+    reward = link.get("reward", 10)
+    await add_credits(uid, reward)
+    await log_claim(uid, f"link:{link_id}")
+    return {"ok": True, "reward": reward, "message": f"+{reward} نقطة!"}
+
+
 # ─── Image processing ───
-async def _run_tool(tool_name: str, file: UploadFile, rec: dict, params: dict = None):
-    params = params or {}
-    user = await get_user_by_id(rec["user_id"])
-    if not user or int(user.get("credits", 0)) < 1: raise HTTPException(402, "Out of credits")
-    if not rate_check(f"user:{rec['user_id']}"): raise HTTPException(429, "Slow down")
-
-    data = await file.read()
-    if len(data) == 0: raise HTTPException(400, "Empty file")
-    if len(data) > MAX_FILE_BYTES: raise HTTPException(413, f"Max {MAX_FILE_MB}MB")
-
-    if tool_name == "remove-bg" and not _rembg_ready:
-        try: await asyncio.wait_for(_rembg_event.wait(), timeout=120.0)
-        except asyncio.TimeoutError: raise HTTPException(503, "Model loading")
-
-    t0 = time.time()
-    tool = TOOLS[tool_name]
-    try:
-        result = await asyncio.to_thread(tool["fn"], data, **params)
-    except ValueError as e:
-        await log_usage(rec["user_id"], tool_name, "error", 0)
-        raise HTTPException(400, str(e))
-    except Exception as e:
-        await log_usage(rec["user_id"], tool_name, "error", 0)
-        raise HTTPException(500, str(e))
-
-    media_type = "image/png"; ext = "png"
-    if isinstance(result, tuple):
-        if len(result) == 3: result, media_type, ext = result
-        elif len(result) == 2: result, ext = result; media_type = f"image/{ext}"
-
-    await deduct_credit(rec["user_id"])
-    await log_usage(rec["user_id"], tool_name, "success", int((time.time() - t0) * 1000), len(result))
-    return Response(content=result, media_type=media_type,
-                    headers={"Content-Disposition": f'attachment; filename="lux_{tool_name}.{ext}"'})
-
-
 @app.post("/api/tool/{tool_name}")
 async def api_tool(tool_name: str, request: Request, file: UploadFile = File(...),
                   x_api_key: Optional[str] = Header(None)):
     if tool_name not in TOOLS: raise HTTPException(404, f"Unknown tool: {tool_name}")
     rec = await authenticate(x_api_key)
+    uid = rec["user_id"]
+    user = await get_user_by_id(uid)
+    if not user or int(user.get("credits", 0)) < 1: raise HTTPException(402, "Out of credits")
+    if not rate_check(f"user:{uid}"): raise HTTPException(429, "Slow down")
+
+    data = await file.read()
+    if not data: raise HTTPException(400, "Empty file")
+    if len(data) > MAX_FILE_BYTES: raise HTTPException(413, f"Max {MAX_FILE_MB}MB")
+    if tool_name == "remove-bg" and not _rembg_ready:
+        try: await asyncio.wait_for(_rembg_event.wait(), timeout=120.0)
+        except asyncio.TimeoutError: raise HTTPException(503, "Model loading")
+
     params = dict(request.query_params)
-    # Convert numeric params
-    for k in ("quality", "radius", "angle", "width", "height", "brightness", "contrast", "saturation", "opacity", "thickness"):
+    for k in ("quality","radius","angle","width","height","brightness","contrast","saturation","opacity","thickness"):
         if k in params:
             try: params[k] = int(params[k])
             except: params.pop(k, None)
-    return await _run_tool(tool_name, file, rec, params)
+
+    t0 = time.time()
+    try:
+        result = await asyncio.to_thread(TOOLS[tool_name], data, **params)
+    except ValueError as e:
+        await log_usage(uid, tool_name, "error", 0); raise HTTPException(400, str(e))
+    except Exception as e:
+        await log_usage(uid, tool_name, "error", 0); raise HTTPException(500, str(e))
+
+    if isinstance(result, tuple):
+        result, media_type, ext = result if len(result) == 3 else (result[0], f"image/{result[1]}", result[1])
+    else:
+        media_type, ext = "image/png", "png"
+
+    await deduct_credit(uid)
+    await log_usage(uid, tool_name, "success", int((time.time()-t0)*1000), len(result))
+    return Response(content=result, media_type=media_type,
+                    headers={"Content-Disposition": f'attachment; filename="lux_{tool_name}.{ext}"'})
 
 
-# ─── Admin ───
-@app.get("/admin", response_class=HTMLResponse)
-async def admin_page(lux_admin: Optional[str] = Cookie(None)):
-    if check_admin_session(lux_admin): return ADMIN_DASHBOARD_HTML
-    return ADMIN_LOGIN_HTML
+# ─── Owner ───
+@app.get("/owner", response_class=HTMLResponse)
+async def owner_page(lux_owner: Optional[str] = Cookie(None)):
+    if check_owner(lux_owner): return OWNER_DASHBOARD_HTML
+    return OWNER_LOGIN_HTML
 
 
-@app.post("/admin/login")
-async def admin_login(password: str = Form(...)):
-    if password != ADMIN_PASSWORD: return RedirectResponse("/admin?error=1", status_code=303)
-    token = new_admin_session()
-    resp = RedirectResponse("/admin", status_code=303)
-    resp.set_cookie("lux_admin", token, max_age=ADMIN_SESSION_HOURS * 3600, httponly=True, samesite="lax")
+@app.post("/owner/login")
+async def owner_login(password: str = Form(...)):
+    if password != OWNER_PASSWORD: return RedirectResponse("/owner?error=1", status_code=303)
+    token = new_owner_session()
+    resp = RedirectResponse("/owner", status_code=303)
+    resp.set_cookie("lux_owner", token, max_age=OWNER_SESSION_HOURS*3600, httponly=True, samesite="lax")
     return resp
 
 
-@app.post("/admin/logout")
-async def admin_logout(lux_admin: Optional[str] = Cookie(None)):
-    if lux_admin: _admin_sessions.pop(lux_admin, None)
-    resp = RedirectResponse("/admin", status_code=303); resp.delete_cookie("lux_admin"); return resp
+@app.post("/owner/logout")
+async def owner_logout(lux_owner: Optional[str] = Cookie(None)):
+    if lux_owner: _owner_sessions.pop(lux_owner, None)
+    resp = RedirectResponse("/owner", status_code=303); resp.delete_cookie("lux_owner"); return resp
 
 
-@app.get("/api/admin/stats")
-async def admin_stats(lux_admin: Optional[str] = Cookie(None)):
-    require_admin(lux_admin)
+@app.get("/api/owner/stats")
+async def owner_stats(lux_owner: Optional[str] = Cookie(None)):
+    require_owner(lux_owner)
     try:
         users = await dss.list("users"); keys = await dss.list("api_keys"); logs = await dss.list("usage_logs")
     except DSSError as e: raise HTTPException(503, str(e))
@@ -785,11 +832,10 @@ async def admin_stats(lux_admin: Optional[str] = Cookie(None)):
     }
 
 
-@app.get("/api/admin/users")
-async def admin_users(lux_admin: Optional[str] = Cookie(None)):
-    require_admin(lux_admin)
-    try:
-        users = await dss.list("users"); keys = await dss.list("api_keys")
+@app.get("/api/owner/users")
+async def owner_users(lux_owner: Optional[str] = Cookie(None)):
+    require_owner(lux_owner)
+    try: users = await dss.list("users"); keys = await dss.list("api_keys")
     except DSSError as e: raise HTTPException(503, str(e))
     key_by_user = {}
     for k in keys:
@@ -800,27 +846,27 @@ async def admin_users(lux_admin: Optional[str] = Cookie(None)):
         uid = str(u.get("id") or u.get("_id") or "")
         k = key_by_user.get(uid) or {}
         items.append({
-            "id": uid, "ip": u.get("ip", "-"), "credits": int(u.get("credits", 0)),
-            "usage_count": int(u.get("usage_count", 0)), "is_banned": bool(u.get("is_banned")),
-            "created_at": u.get("created_at", ""), "prefix": k.get("prefix", "-"),
+            "id": uid, "ip": u.get("ip","-"), "credits": int(u.get("credits",0)),
+            "usage_count": int(u.get("usage_count",0)), "is_banned": bool(u.get("is_banned")),
+            "created_at": u.get("created_at",""), "prefix": k.get("prefix","-"),
         })
-    items.sort(key=lambda x: x.get("created_at", ""), reverse=True)
-    return {"items": items[:200], "total": len(items)}
+    items.sort(key=lambda x: x.get("created_at",""), reverse=True)
+    return {"items": items[:300], "total": len(items)}
 
 
-@app.post("/api/admin/user/credits")
-async def admin_user_credits(user_id: str = Form(...), amount: int = Form(...),
-                            lux_admin: Optional[str] = Cookie(None)):
-    require_admin(lux_admin)
+@app.post("/api/owner/user/credits")
+async def owner_user_credits(user_id: str = Form(...), amount: int = Form(...),
+                            lux_owner: Optional[str] = Cookie(None)):
+    require_owner(lux_owner)
     if amount == 0: raise HTTPException(400, "Amount zero")
-    if not await add_credits(user_id, amount): raise HTTPException(404, "User not found")
+    if not await add_credits(user_id, amount): raise HTTPException(404, "Not found")
     return {"ok": True}
 
 
-@app.post("/api/admin/user/ban")
-async def admin_user_ban(user_id: str = Form(...), ban: bool = Form(True),
-                        lux_admin: Optional[str] = Cookie(None)):
-    require_admin(lux_admin)
+@app.post("/api/owner/user/ban")
+async def owner_user_ban(user_id: str = Form(...), ban: bool = Form(True),
+                        lux_owner: Optional[str] = Cookie(None)):
+    require_owner(lux_owner)
     user = await get_user_by_id(user_id)
     if not user: raise HTTPException(404, "Not found")
     did = DSS.doc_id(user)
@@ -828,8 +874,44 @@ async def admin_user_ban(user_id: str = Form(...), ban: bool = Form(True),
     await dss.update("users", did, {"is_banned": ban})
     return {"ok": True}
 
+
+@app.get("/api/owner/config")
+async def owner_config(lux_owner: Optional[str] = Cookie(None)):
+    require_owner(lux_owner)
+    return await get_tasks_config()
+
+
+@app.post("/api/owner/config")
+async def owner_save_config(
+    daily_reward: int = Form(...), share_reward: int = Form(...), invite_reward: int = Form(...),
+    links_json: str = Form(...), lux_owner: Optional[str] = Cookie(None)
+):
+    require_owner(lux_owner)
+    import json as _json
+    try: links = _json.loads(links_json)
+    except: raise HTTPException(400, "Invalid links JSON")
+    cfg = {
+        "daily_checkin": {"reward": daily_reward, "label": "زيارة يومية"},
+        "share_app": {"reward": share_reward, "label": "مشاركة التطبيق"},
+        "invite_friend": {"reward": invite_reward, "label": "دعوة صديق"},
+        "links": links,
+    }
+    if not await save_tasks_config(cfg): raise HTTPException(500, "Save failed")
+    return {"ok": True}
+
+
+@app.post("/api/owner/change-password")
+async def owner_change_password(old_password: str = Form(...), new_password: str = Form(...),
+                                lux_owner: Optional[str] = Cookie(None)):
+    require_owner(lux_owner)
+    global OWNER_PASSWORD
+    if old_password != OWNER_PASSWORD: raise HTTPException(401, "Wrong old password")
+    if len(new_password) < 4: raise HTTPException(400, "Too short")
+    OWNER_PASSWORD = new_password
+    return {"ok": True}
+
 # ═══════════════════════════════════════════════════════════════════
-#  HTML - MAIN APP (with sidebar drawer + 9 pages)
+#  MAIN HTML (Sidebar + 10 pages)
 # ═══════════════════════════════════════════════════════════════════
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -837,231 +919,184 @@ HTML_PAGE = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="theme-color" content="#00e0ff">
-<meta name="apple-mobile-web-app-capable" content="yes">
-<meta name="mobile-web-app-capable" content="yes">
 <title>Lux Studio VIP</title>
 <link rel="manifest" href="/manifest.json">
 <link rel="icon" href="/icon.svg" type="image/svg+xml">
 <link href="https://fonts.googleapis.com/css2?family=Tajawal:wght@400;500;700;900&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#05070f;--bg2:#0a0e1a;--surface:rgba(255,255,255,.035);--surface2:rgba(255,255,255,.08);--border:rgba(255,255,255,.08);--text:#e8ecf4;--muted:#8a94a8;--cyan:#00e0ff;--purple:#7c5cff;--pink:#ff2d95;--success:#00ffa3;--danger:#ff4d6d;--warn:#ffb020;--grad:linear-gradient(135deg,#00e0ff 0%,#7c5cff 50%,#ff2d95 100%);--shadow:0 20px 60px rgba(0,0,0,.5);--drawer-w:280px;--header-h:64px}
+:root{--bg:#05070f;--bg2:#0a0e1a;--surface:rgba(255,255,255,.035);--surface2:rgba(255,255,255,.08);--border:rgba(255,255,255,.08);--text:#e8ecf4;--muted:#8a94a8;--cyan:#00e0ff;--success:#00ffa3;--danger:#ff4d6d;--warn:#ffb020;--grad:linear-gradient(135deg,#00e0ff 0%,#7c5cff 50%,#ff2d95 100%);--drawer-w:280px;--hh:60px}
 body.light{--bg:#f5f7fb;--bg2:#e8ecf4;--surface:#fff;--surface2:#f0f3f8;--border:rgba(0,0,0,.08);--text:#0a0e1a;--muted:#5a6478}
 *{box-sizing:border-box;margin:0;padding:0}
-html{scroll-behavior:smooth}
-body{font-family:'Tajawal',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6;overflow-x:hidden;-webkit-tap-highlight-color:transparent;transition:background .3s,color .3s}
+body{font-family:'Tajawal',sans-serif;background:var(--bg);color:var(--text);min-height:100vh;line-height:1.6;overflow-x:hidden}
 body::before{content:'';position:fixed;inset:0;z-index:-1;pointer-events:none;background:radial-gradient(circle at 15% 20%,rgba(0,224,255,.10),transparent 35%),radial-gradient(circle at 85% 15%,rgba(124,92,255,.12),transparent 35%),radial-gradient(circle at 50% 90%,rgba(255,45,149,.08),transparent 40%)}
 body.light::before{opacity:.35}
 a{color:var(--cyan);text-decoration:none}
-/* Header */
-header{position:fixed;top:0;left:0;right:0;height:var(--header-h);z-index:100;backdrop-filter:blur(20px);background:rgba(5,7,15,.85);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 16px}
+header{position:fixed;top:0;left:0;right:0;height:var(--hh);z-index:100;backdrop-filter:blur(20px);background:rgba(5,7,15,.85);border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between;padding:0 14px}
 body.light header{background:rgba(245,247,251,.85)}
-.hamburger{background:transparent;border:1px solid var(--border);color:var(--text);width:42px;height:42px;border-radius:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:1.3rem}
-.hamburger:hover{background:var(--surface2)}
-.header-title{font-weight:900;font-size:1.05rem;text-align:center;flex:1}
-.header-title small{display:block;font-size:.65rem;color:var(--muted);font-weight:600}
-.header-actions{display:flex;gap:8px}
+.ham{background:transparent;border:1px solid var(--border);color:var(--text);width:42px;height:42px;border-radius:10px;cursor:pointer;font-size:1.3rem}
+.ham:hover{background:var(--surface2)}
+.h-title{font-weight:900;font-size:1rem;text-align:center;flex:1}
+.h-title small{display:block;font-size:.65rem;color:var(--muted);font-weight:600}
+.h-actions{display:flex;gap:8px}
 .icon-btn{background:var(--surface2);border:1px solid var(--border);color:var(--text);width:42px;height:42px;border-radius:10px;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:1rem;text-decoration:none}
 .icon-btn:hover{background:rgba(255,255,255,.12)}
-/* Drawer */
-.drawer-overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;opacity:0;pointer-events:none;transition:opacity .3s;backdrop-filter:blur(4px)}
-.drawer-overlay.open{opacity:1;pointer-events:all}
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:200;opacity:0;pointer-events:none;transition:opacity .3s;backdrop-filter:blur(4px)}
+.overlay.open{opacity:1;pointer-events:all}
 .drawer{position:fixed;top:0;bottom:0;right:-320px;width:var(--drawer-w);background:var(--bg2);border-left:1px solid var(--border);z-index:201;transition:right .3s cubic-bezier(.4,0,.2,1);display:flex;flex-direction:column;overflow-y:auto}
 body.light .drawer{background:#fff}
 .drawer.open{right:0}
-.drawer-header{padding:24px 20px;border-bottom:1px solid var(--border);text-align:center}
-.drawer-logo{font-size:1.5rem;font-weight:900}
-.drawer-logo span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
-.drawer-user{margin-top:12px;padding:10px;background:var(--surface);border-radius:10px;font-size:.8rem}
-.drawer-user .credits{font-size:1.2rem;font-weight:900;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-family:'JetBrains Mono',monospace}
-.drawer-nav{flex:1;padding:12px 0}
-.nav-item{display:flex;align-items:center;gap:14px;padding:14px 20px;color:var(--text);cursor:pointer;border:none;background:transparent;width:100%;text-align:right;font-family:inherit;font-size:.95rem;font-weight:600;transition:background .2s;border-right:3px solid transparent}
+.d-head{padding:20px;border-bottom:1px solid var(--border);text-align:center}
+.d-logo{font-size:1.4rem;font-weight:900}
+.d-logo span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.d-user{margin-top:10px;padding:10px;background:var(--surface);border-radius:10px;font-size:.78rem}
+.d-user .cr{font-size:1.2rem;font-weight:900;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-family:'JetBrains Mono',monospace}
+.d-nav{flex:1;padding:10px 0}
+.nav-item{display:flex;align-items:center;gap:12px;padding:13px 20px;color:var(--text);cursor:pointer;border:none;background:transparent;width:100%;text-align:right;font-family:inherit;font-size:.92rem;font-weight:600;transition:background .2s;border-right:3px solid transparent}
 .nav-item:hover{background:var(--surface)}
 .nav-item.active{background:var(--surface2);border-right-color:var(--cyan);color:var(--cyan)}
-.nav-item .ico{font-size:1.3rem;width:28px;text-align:center}
-.nav-item .badge{margin-right:auto;background:rgba(0,255,163,.15);color:var(--success);padding:2px 8px;border-radius:20px;font-size:.7rem;font-weight:700}
-.drawer-footer{padding:16px;border-top:1px solid var(--border);font-size:.75rem;color:var(--muted);text-align:center}
-.drawer-footer a{color:var(--muted)}
-.drawer-footer a:hover{color:var(--cyan)}
-/* Main */
-main{padding-top:calc(var(--header-h) + 16px);padding-bottom:40px;max-width:1000px;margin:0 auto;padding-left:16px;padding-right:16px;min-height:100vh}
+.nav-item .ico{font-size:1.3rem;width:26px;text-align:center}
+.d-foot{padding:14px;border-top:1px solid var(--border);font-size:.72rem;color:var(--muted);text-align:center}
+main{padding-top:calc(var(--hh) + 14px);padding-bottom:40px;max-width:1000px;margin:0 auto;padding-left:14px;padding-right:14px;min-height:100vh}
 .page{animation:fadeIn .25s ease}
 @keyframes fadeIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-.page h1{font-size:1.5rem;font-weight:900;margin-bottom:4px}
-.page .sub{color:var(--muted);font-size:.9rem;margin-bottom:24px}
+.page h1{font-size:1.4rem;font-weight:900;margin-bottom:4px}
+.page .sub{color:var(--muted);font-size:.85rem;margin-bottom:20px}
 .hidden{display:none !important}
-/* Cards */
-.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:20px;backdrop-filter:blur(10px)}
-.card h3{font-size:1.1rem;margin-bottom:12px;font-weight:700}
-/* Stats */
-.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:20px}
-.stat{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px;text-align:center}
-.stat .num{font-size:1.8rem;font-weight:900;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-family:'JetBrains Mono',monospace}
-.stat .lbl{font-size:.75rem;color:var(--muted);margin-top:4px}
-/* Buttons */
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:13px 22px;border-radius:12px;border:none;cursor:pointer;font-family:inherit;font-size:.95rem;font-weight:700;transition:all .2s;text-decoration:none}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:18px;backdrop-filter:blur(10px);margin-bottom:14px}
+.card h3{font-size:1.05rem;margin-bottom:10px;font-weight:700}
+.stats-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));gap:10px;margin-bottom:16px}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;text-align:center}
+.stat .num{font-size:1.6rem;font-weight:900;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-family:'JetBrains Mono',monospace}
+.stat .lbl{font-size:.72rem;color:var(--muted);margin-top:2px}
+.btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;padding:12px 20px;border-radius:12px;border:none;cursor:pointer;font-family:inherit;font-size:.9rem;font-weight:700;transition:all .2s;text-decoration:none}
 .btn:disabled{opacity:.5;cursor:not-allowed}
 .btn-primary{background:var(--grad);color:#05070f;box-shadow:0 8px 30px rgba(124,92,255,.4)}
 .btn-primary:hover:not(:disabled){transform:translateY(-2px)}
 .btn-secondary{background:var(--surface2);color:var(--text);border:1px solid var(--border)}
 .btn-secondary:hover:not(:disabled){background:rgba(255,255,255,.12)}
 .btn-block{width:100%}
-.btn-lg{padding:16px 28px;font-size:1rem}
-/* Upload zone */
-.upload-zone{border:2px dashed var(--border);border-radius:16px;padding:44px 20px;text-align:center;cursor:pointer;transition:all .25s;background:var(--surface);margin-bottom:20px}
+.btn-lg{padding:15px 26px;font-size:.95rem}
+.upload-zone{border:2px dashed var(--border);border-radius:16px;padding:38px 20px;text-align:center;cursor:pointer;transition:all .25s;background:var(--surface);margin-bottom:16px}
 .upload-zone:hover,.upload-zone.dragover{border-color:var(--cyan);background:rgba(0,224,255,.05)}
-.upload-zone svg{width:44px;height:44px;stroke:var(--cyan);margin-bottom:10px}
-.upload-zone h3{font-size:1.05rem;margin-bottom:4px}
-.upload-zone p{color:var(--muted);font-size:.85rem}
+.upload-zone svg{width:42px;height:42px;stroke:var(--cyan);margin-bottom:10px}
+.upload-zone h3{font-size:1rem;margin-bottom:4px}
+.upload-zone p{color:var(--muted);font-size:.8rem}
 .upload-zone input{display:none}
-/* Tools grid */
-.tools-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:10px}
-.tool-btn{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:16px 8px;border-radius:14px;cursor:pointer;font-family:inherit;font-weight:700;font-size:.8rem;transition:all .2s;display:flex;flex-direction:column;align-items:center;gap:6px;text-align:center}
+.tools-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(105px,1fr));gap:8px}
+.tool-btn{background:var(--surface);border:1px solid var(--border);color:var(--text);padding:14px 6px;border-radius:12px;cursor:pointer;font-family:inherit;font-weight:700;font-size:.78rem;transition:all .2s;display:flex;flex-direction:column;align-items:center;gap:5px;text-align:center}
 .tool-btn:hover:not(:disabled){background:rgba(0,224,255,.1);border-color:var(--cyan);transform:translateY(-2px)}
-.tool-btn .ic{font-size:1.6rem}
-.tool-btn .lbl{line-height:1.2}
-/* Preview */
-.preview-row{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px}
+.tool-btn .ic{font-size:1.5rem}
+.preview-row{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:12px}
 @media(max-width:600px){.preview-row{grid-template-columns:1fr}}
-.img-box{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:10px;text-align:center}
-.img-box .label{font-size:.7rem;color:var(--muted);text-transform:uppercase;letter-spacing:1px;font-weight:700;margin-bottom:8px}
-.img-box img{max-width:100%;max-height:320px;border-radius:8px;display:block;margin:0 auto}
+.img-box{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:8px;text-align:center}
+.img-box .label{font-size:.68rem;color:var(--muted);text-transform:uppercase;font-weight:700;margin-bottom:6px}
+.img-box img{max-width:100%;max-height:300px;border-radius:8px;display:block;margin:0 auto}
 .checker{background-image:linear-gradient(45deg,#1a1f2e 25%,transparent 25%),linear-gradient(-45deg,#1a1f2e 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#1a1f2e 75%),linear-gradient(-45deg,transparent 75%,#1a1f2e 75%);background-size:16px 16px;background-position:0 0,0 8px,8px -8px,-8px 0;background-color:#0d1220;border-radius:8px;padding:6px}
-/* Loading */
-.loading{display:flex;flex-direction:column;align-items:center;padding:30px;gap:12px}
-.spinner{width:42px;height:42px;border-radius:50%;border:4px solid var(--border);border-top-color:var(--cyan);animation:spin 1s linear infinite}
+.loading{display:flex;flex-direction:column;align-items:center;padding:30px;gap:10px}
+.spinner{width:40px;height:40px;border-radius:50%;border:4px solid var(--border);border-top-color:var(--cyan);animation:spin 1s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
-.loading p{color:var(--muted);font-size:.9rem}
-/* Forms */
-.form-group{margin-bottom:16px}
-.form-group label{display:block;margin-bottom:6px;font-weight:600;font-size:.85rem;color:var(--muted)}
-.form-input{width:100%;padding:12px 14px;border-radius:10px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-family:inherit;font-size:.9rem}
+.loading p{color:var(--muted);font-size:.85rem}
+.form-group{margin-bottom:14px}
+.form-group label{display:block;margin-bottom:5px;font-weight:600;font-size:.82rem;color:var(--muted)}
+.form-input{width:100%;padding:11px 13px;border-radius:10px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-family:inherit;font-size:.88rem}
 .form-input:focus{outline:none;border-color:var(--cyan)}
-select.form-input{cursor:pointer}
-/* API key display */
-.key-display{display:flex;gap:8px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px 14px;align-items:center;font-family:'JetBrains Mono',monospace;font-size:.8rem;margin-bottom:10px;word-break:break-all}
+.key-display{display:flex;gap:6px;background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:10px 12px;align-items:center;font-family:'JetBrains Mono',monospace;font-size:.75rem;margin-bottom:8px;word-break:break-all}
 .key-display span{flex:1;color:var(--cyan);text-align:left;direction:ltr;overflow:hidden}
-.key-display button{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:6px 10px;border-radius:8px;cursor:pointer;font-weight:700;font-size:.75rem}
-/* History */
-.history-item{display:flex;justify-content:space-between;align-items:center;padding:12px;background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;font-size:.85rem}
-.history-item .action{font-weight:700}
-.history-item .time{color:var(--muted);font-size:.75rem}
-/* Toast */
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(150%);background:var(--bg2);border:1px solid var(--border);padding:12px 22px;border-radius:12px;box-shadow:var(--shadow);z-index:999;font-weight:600;font-size:.9rem;transition:transform .3s;max-width:calc(100% - 32px);text-align:center}
+.key-display button{background:var(--surface2);border:1px solid var(--border);color:var(--text);padding:5px 9px;border-radius:6px;cursor:pointer;font-weight:700;font-size:.72rem}
+.history-item{display:flex;justify-content:space-between;align-items:center;padding:11px;background:var(--surface);border:1px solid var(--border);border-radius:10px;margin-bottom:8px;font-size:.82rem}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(150%);background:var(--bg2);border:1px solid var(--border);padding:12px 20px;border-radius:12px;z-index:999;font-weight:600;font-size:.88rem;transition:transform .3s;max-width:calc(100% - 32px);text-align:center}
 .toast.show{transform:translateX(-50%) translateY(0)}
 .toast.error{border-color:rgba(255,77,109,.4);color:var(--danger)}
 .toast.success{border-color:rgba(0,255,163,.4);color:var(--success)}
-/* Modal / Bottom sheet */
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:300;display:none;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px)}
 .modal-overlay.show{display:flex}
 @media(max-width:600px){.modal-overlay{align-items:flex-end;padding:0}}
-.modal{background:var(--bg2);border:1px solid var(--border);border-radius:20px;padding:24px;max-width:500px;width:100%;max-height:90vh;overflow-y:auto;animation:slideUp .3s ease}
-@media(max-width:600px){.modal{border-radius:20px 20px 0 0;max-height:85vh}}
-@keyframes slideUp{from{transform:translateY(40px);opacity:0}to{transform:translateY(0);opacity:1}}
-.modal h3{margin-bottom:16px;font-size:1.1rem;font-weight:700}
-.modal-actions{display:flex;gap:10px;margin-top:16px}
+.modal{background:var(--bg2);border:1px solid var(--border);border-radius:20px;padding:22px;max-width:500px;width:100%;max-height:90vh;overflow-y:auto}
+@media(max-width:600px){.modal{border-radius:20px 20px 0 0}}
+.modal h3{margin-bottom:14px;font-size:1.05rem;font-weight:700}
+.modal-actions{display:flex;gap:8px;margin-top:14px}
 .modal-actions .btn{flex:1}
-/* Install button */
-.install-btn{display:none;position:fixed;bottom:16px;right:16px;z-index:150;padding:12px 20px;border-radius:30px;border:none;cursor:pointer;background:var(--grad);color:#05070f;font-family:inherit;font-weight:800;font-size:.85rem;box-shadow:0 10px 30px rgba(124,92,255,.5)}
+.install-btn{display:none;position:fixed;bottom:16px;right:16px;z-index:150;padding:11px 18px;border-radius:30px;border:none;cursor:pointer;background:var(--grad);color:#05070f;font-family:inherit;font-weight:800;font-size:.82rem;box-shadow:0 10px 30px rgba(124,92,255,.5)}
 .install-btn.show{display:flex;align-items:center;gap:6px}
-/* Grid helpers */
-.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 @media(max-width:500px){.grid-2{grid-template-columns:1fr}}
-.tag{display:inline-block;padding:3px 10px;border-radius:20px;font-size:.7rem;font-weight:700;background:rgba(0,255,163,.15);color:var(--success)}
-.tag-warn{background:rgba(255,176,32,.15);color:var(--warn)}
-.tag-danger{background:rgba(255,77,109,.15);color:var(--danger)}
+.task-card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:16px;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center;gap:10px}
+.task-card .info{flex:1}
+.task-card .title{font-weight:700;font-size:.92rem}
+.task-card .reward{color:var(--success);font-size:.82rem;font-weight:700;margin-top:2px}
+.task-card .btn{flex-shrink:0}
+.task-card.done{opacity:.6}
+.badge-claimed{background:rgba(0,255,163,.15);color:var(--success);padding:4px 10px;border-radius:20px;font-size:.72rem;font-weight:700}
+.banner{background:linear-gradient(135deg,rgba(0,224,255,.08),rgba(124,92,255,.08));border:1px solid rgba(0,224,255,.25);border-radius:14px;padding:18px;text-align:center;margin-bottom:16px}
 </style>
 </head>
 <body>
-
 <header>
-<button class="hamburger" onclick="openDrawer()" aria-label="القائمة">☰</button>
-<div class="header-title">
-<span id="header-title">Lux Studio</span>
-<small id="header-sub">VIP Edition</small>
-</div>
-<div class="header-actions">
-<a href="/admin" class="icon-btn" title="المدير">👑</a>
-</div>
+<button class="ham" onclick="openDrawer()">☰</button>
+<div class="h-title"><span id="h-title">Lux Studio</span><small id="h-sub">VIP v7</small></div>
+<div class="h-actions"><a href="/owner" class="icon-btn" title="المالك">👑</a></div>
 </header>
 
-<div class="drawer-overlay" id="drawer-overlay" onclick="closeDrawer()"></div>
+<div class="overlay" id="overlay" onclick="closeDrawer()"></div>
 <aside class="drawer" id="drawer">
-<div class="drawer-header">
-<div class="drawer-logo">Lux<span>.</span>VIP</div>
-<div class="drawer-user">
-<div style="font-size:.7rem;color:var(--muted);margin-bottom:4px">رصيدك</div>
-<div class="credits" id="drawer-credits">-</div>
+<div class="d-head">
+<div class="d-logo">Lux<span>.</span>VIP</div>
+<div class="d-user"><div style="font-size:.68rem;color:var(--muted);margin-bottom:2px">رصيدك</div><div class="cr" id="d-credits">-</div></div>
 </div>
-</div>
-<nav class="drawer-nav">
+<nav class="d-nav">
 <button class="nav-item active" data-page="home" onclick="navigate('home')"><span class="ico">🏠</span>الرئيسية</button>
 <button class="nav-item" data-page="remove-bg" onclick="navigate('remove-bg')"><span class="ico">🖼️</span>إزالة الخلفية</button>
 <button class="nav-item" data-page="enhance" onclick="navigate('enhance')"><span class="ico">✨</span>تحسين الجودة</button>
 <button class="nav-item" data-page="designer" onclick="navigate('designer')"><span class="ico">🎨</span>أدوات المصمم</button>
-<button class="nav-item" data-page="editor" onclick="navigate('editor')"><span class="ico">✂️</span>محرر متقدم</button>
+<button class="nav-item" data-page="tasks" onclick="navigate('tasks')"><span class="ico">🎁</span>المهام والجوائز</button>
 <button class="nav-item" data-page="api" onclick="navigate('api')"><span class="ico">🔑</span>مفاتيح API</button>
 <button class="nav-item" data-page="history" onclick="navigate('history')"><span class="ico">📜</span>سجلي</button>
 <button class="nav-item" data-page="settings" onclick="navigate('settings')"><span class="ico">⚙️</span>الإعدادات</button>
 <button class="nav-item" data-page="help" onclick="navigate('help')"><span class="ico">❓</span>المساعدة</button>
 </nav>
-<div class="drawer-footer">
-<div>Lux Studio VIP v6</div>
-<div style="margin-top:4px">© 2025 — Premium ✨</div>
-</div>
+<div class="d-foot">Lux Studio VIP v7<br>© 2025 — Premium ✨</div>
 </aside>
 
-<button class="install-btn" id="install-btn" onclick="doInstall()">📱 تثبيت التطبيق</button>
+<button class="install-btn" id="install-btn" onclick="doInstall()">📱 تثبيت</button>
 
 <main>
 
-<!-- ═══ HOME ═══ -->
+<!-- HOME -->
 <section class="page" id="page-home">
 <h1>👋 أهلاً بك</h1>
-<p class="sub">استوديو احترافي بـ 17 أداة مصمم</p>
-
-<div id="welcome-section">
-<div class="card" style="text-align:center;padding:40px 24px">
-<div style="font-size:3rem;margin-bottom:16px">🚀</div>
-<h3 style="margin-bottom:8px">احصل على مفتاحك المجاني</h3>
-<p style="color:var(--muted);font-size:.9rem;margin-bottom:20px">30 عملية مجانية — بدون بطاقة بنكية</p>
-<button class="btn btn-primary btn-lg" onclick="getFreeKey()">🎁 احصل على مفتاح الآن</button>
-</div>
-</div>
-
-<div id="dashboard-section" class="hidden">
+<p class="sub">Lux Studio VIP — 21 أداة مصمم + مهام</p>
 <div class="stats-grid">
-<div class="stat"><div class="num" id="st-credits">-</div><div class="lbl">نقطة متبقية</div></div>
-<div class="stat"><div class="num" id="st-ops">-</div><div class="lbl">إجمالي العمليات</div></div>
+<div class="stat"><div class="num" id="st-credits">-</div><div class="lbl">نقطة</div></div>
+<div class="stat"><div class="num" id="st-ops">-</div><div class="lbl">عملية</div></div>
 <div class="stat"><div class="num" id="st-success">-</div><div class="lbl">ناجحة</div></div>
 </div>
 <div class="card">
 <h3>⚡ إجراءات سريعة</h3>
-<div class="grid-2" style="margin-top:12px">
+<div class="grid-2" style="margin-top:10px">
 <button class="btn btn-primary" onclick="navigate('remove-bg')">🖼️ إزالة خلفية</button>
 <button class="btn btn-secondary" onclick="navigate('enhance')">✨ تحسين صورة</button>
 <button class="btn btn-secondary" onclick="navigate('designer')">🎨 أدوات المصمم</button>
-<button class="btn btn-secondary" onclick="navigate('api')">🔑 إدارة API</button>
-</div>
+<button class="btn btn-secondary" onclick="navigate('tasks')">🎁 اكسب نقاط</button>
 </div>
 </div>
 </section>
 
-<!-- ═══ REMOVE BG ═══ -->
+<!-- REMOVE BG -->
 <section class="page hidden" id="page-remove-bg">
 <h1>🖼️ إزالة الخلفية</h1>
-<p class="sub">خلفية شفافة بدقة احترافية (U2Net AI)</p>
+<p class="sub">خلفية شفافة بدقة احترافية</p>
 <div class="upload-zone" onclick="pickFile('remove-bg')">
 <input type="file" accept="image/*" id="file-remove-bg">
-<svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-<h3>اختر صورة</h3><p>PNG · JPG · WEBP — حتى 15MB</p>
+<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+<h3>اختر صورة</h3><p>PNG · JPG · WEBP</p>
 </div>
 <div id="result-remove-bg" class="hidden"></div>
 </section>
 
-<!-- ═══ ENHANCE ═══ -->
+<!-- ENHANCE -->
 <section class="page hidden" id="page-enhance">
 <h1>✨ تحسين الجودة</h1>
-<p class="sub">تكبير ×2 + Unsharp Mask + تحسين ألوان</p>
+<p class="sub">تكبير ×2 + حدة + ألوان</p>
 <div class="upload-zone" onclick="pickFile('enhance')">
 <input type="file" accept="image/*" id="file-enhance">
 <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
@@ -1070,10 +1105,10 @@ select.form-input{cursor:pointer}
 <div id="result-enhance" class="hidden"></div>
 </section>
 
-<!-- ═══ DESIGNER ═══ -->
+<!-- DESIGNER -->
 <section class="page hidden" id="page-designer">
 <h1>🎨 أدوات المصمم</h1>
-<p class="sub">19 أداة احترافية جاهزة</p>
+<p class="sub">19 أداة احترافية</p>
 <div class="upload-zone" onclick="pickFile('designer')">
 <input type="file" accept="image/*" id="file-designer">
 <svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
@@ -1081,731 +1116,621 @@ select.form-input{cursor:pointer}
 </div>
 <div id="designer-tools" class="hidden">
 <div class="tools-grid">
-<button class="tool-btn" onclick="runSimple('compress',{quality:70})"><span class="ic">📉</span><span class="lbl">ضغط</span></button>
-<button class="tool-btn" onclick="runSimple('grayscale')"><span class="ic">⚫</span><span class="lbl">رمادي</span></button>
-<button class="tool-btn" onclick="runSimple('sepia')"><span class="ic">🌅</span><span class="lbl">سيبيا</span></button>
-<button class="tool-btn" onclick="runSimple('invert')"><span class="ic">🌗</span><span class="lbl">انعكاس</span></button>
-<button class="tool-btn" onclick="runSimple('blur',{radius:5})"><span class="ic">💨</span><span class="lbl">بلور</span></button>
-<button class="tool-btn" onclick="runSimple('sharpen')"><span class="ic">🔪</span><span class="lbl">حدّة</span></button>
-<button class="tool-btn" onclick="runSimple('vintage')"><span class="ic">📷</span><span class="lbl">فينتاج</span></button>
-<button class="tool-btn" onclick="runSimple('warm')"><span class="ic">☀️</span><span class="lbl">دافئ</span></button>
-<button class="tool-btn" onclick="runSimple('cool')"><span class="ic">❄️</span><span class="lbl">بارد</span></button>
-<button class="tool-btn" onclick="runSimple('rotate',{angle:90})"><span class="ic">🔃</span><span class="lbl">تدوير 90°</span></button>
-<button class="tool-btn" onclick="runSimple('flip',{direction:'h'})"><span class="ic">↔️</span><span class="lbl">قلب أفقي</span></button>
-<button class="tool-btn" onclick="runSimple('convert',{target:'png'})"><span class="ic">🔄</span><span class="lbl">PNG</span></button>
-<button class="tool-btn" onclick="runSimple('convert',{target:'webp'})"><span class="ic">🔄</span><span class="lbl">WEBP</span></button>
-<button class="tool-btn" onclick="openCropModal()"><span class="ic">✂️</span><span class="lbl">قص</span></button>
-<button class="tool-btn" onclick="openResizeModal()"><span class="ic">📐</span><span class="lbl">تحجيم</span></button>
-<button class="tool-btn" onclick="openWatermarkModal()"><span class="ic">💧</span><span class="lbl">علامة مائية</span></button>
-<button class="tool-btn" onclick="openAdjustModal()"><span class="ic">🎚️</span><span class="lbl">ضبط</span></button>
-<button class="tool-btn" onclick="openBgColorModal()"><span class="ic">🎨</span><span class="lbl">خلفية لون</span></button>
-<button class="tool-btn" onclick="runSimple('round-corners',{radius:40})"><span class="ic">⭕</span><span class="lbl">زوايا</span></button>
-<button class="tool-btn" onclick="runSimple('border',{thickness:20})"><span class="ic">🖼️</span><span class="lbl">إطار</span></button>
+<button class="tool-btn" onclick="runSimple('compress',{quality:70})"><span class="ic">📉</span>ضغط</button>
+<button class="tool-btn" onclick="runSimple('grayscale')"><span class="ic">⚫</span>رمادي</button>
+<button class="tool-btn" onclick="runSimple('sepia')"><span class="ic">🌅</span>سيبيا</button>
+<button class="tool-btn" onclick="runSimple('invert')"><span class="ic">🌗</span>انعكاس</button>
+<button class="tool-btn" onclick="runSimple('blur',{radius:5})"><span class="ic">💨</span>بلور</button>
+<button class="tool-btn" onclick="runSimple('sharpen')"><span class="ic">🔪</span>حدّة</button>
+<button class="tool-btn" onclick="runSimple('vintage')"><span class="ic">📷</span>فينتاج</button>
+<button class="tool-btn" onclick="runSimple('warm')"><span class="ic">☀️</span>دافئ</button>
+<button class="tool-btn" onclick="runSimple('cool')"><span class="ic">❄️</span>بارد</button>
+<button class="tool-btn" onclick="runSimple('rotate',{angle:90})"><span class="ic">🔃</span>تدوير</button>
+<button class="tool-btn" onclick="runSimple('flip',{direction:'h'})"><span class="ic">↔️</span>قلب</button>
+<button class="tool-btn" onclick="runSimple('convert',{target:'png'})"><span class="ic">🔄</span>PNG</button>
+<button class="tool-btn" onclick="runSimple('convert',{target:'webp'})"><span class="ic">🔄</span>WEBP</button>
+<button class="tool-btn" onclick="openModal('modal-crop')"><span class="ic">✂️</span>قص</button>
+<button class="tool-btn" onclick="openModal('modal-resize')"><span class="ic">📐</span>تحجيم</button>
+<button class="tool-btn" onclick="openModal('modal-wm')"><span class="ic">💧</span>علامة مائية</button>
+<button class="tool-btn" onclick="openModal('modal-adjust')"><span class="ic">🎚️</span>ضبط</button>
+<button class="tool-btn" onclick="openModal('modal-bg')"><span class="ic">🎨</span>خلفية لون</button>
+<button class="tool-btn" onclick="runSimple('round-corners',{radius:40})"><span class="ic">⭕</span>زوايا</button>
+<button class="tool-btn" onclick="runSimple('border',{thickness:20})"><span class="ic">🖼️</span>إطار</button>
 </div>
 </div>
 <div id="result-designer" class="hidden"></div>
 </section>
 
-<!-- ═══ EDITOR ═══ -->
-<section class="page hidden" id="page-editor">
-<h1>✂️ المحرر المتقدم</h1>
-<p class="sub">تحكم كامل بالصورة</p>
-<div class="upload-zone" onclick="pickFile('editor')">
-<input type="file" accept="image/*" id="file-editor">
-<svg viewBox="0 0 24 24" fill="none" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
-<h3>اختر صورة</h3><p>استخدم الأدوات المتقدمة</p>
+<!-- TASKS -->
+<section class="page hidden" id="page-tasks">
+<h1>🎁 المهام والجوائز</h1>
+<p class="sub">اكسب نقاط مجانية</p>
+<div class="banner">
+<div style="font-size:1.8rem;margin-bottom:6px">🏆</div>
+<div style="font-weight:700">اجمع النقاط من المهام والاشتراكات</div>
 </div>
-<div id="editor-tools" class="hidden">
-<div class="grid-2">
-<button class="btn btn-secondary" onclick="openCropModal()">✂️ قص بنسبة</button>
-<button class="btn btn-secondary" onclick="openResizeModal()">📐 تحجيم</button>
-<button class="btn btn-secondary" onclick="openWatermarkModal()">💧 علامة مائية</button>
-<button class="btn btn-secondary" onclick="openAdjustModal()">🎚️ ضبط</button>
-<button class="btn btn-secondary" onclick="openBgColorModal()">🎨 خلفية لون</button>
-<button class="btn btn-secondary" onclick="runSimple('border',{thickness:20})">🖼️ إطار</button>
-</div>
-</div>
-<div id="result-editor" class="hidden"></div>
+<div id="tasks-list"><div class="loading"><div class="spinner"></div><p>جاري التحميل...</p></div></div>
 </section>
 
-<!-- ═══ API KEYS ═══ -->
+<!-- API -->
 <section class="page hidden" id="page-api">
 <h1>🔑 مفاتيح API</h1>
-<p class="sub">اربط خدماتك ببوتات أو مواقع أخرى</p>
-
-<div id="api-no-key" class="card">
-<h3>لا يوجد مفتاح بعد</h3>
-<p style="color:var(--muted);margin-bottom:16px">احصل على مفتاح مجاني فورًا</p>
-<button class="btn btn-primary btn-block" onclick="getFreeKey()">🎁 إنشاء مفتاح</button>
-</div>
-
-<div id="api-with-key" class="hidden">
-<div class="card" style="margin-bottom:16px">
+<p class="sub">اربط خدماتك ببوتات أو مواقع</p>
+<div class="card">
 <h3>🔑 مفتاحك الحالي</h3>
 <div class="key-display">
 <span id="api-key-masked">-</span>
-<button onclick="toggleKeyVis()" id="btn-toggle-key">👁</button>
+<button onclick="toggleKeyVis()" id="btn-toggle">👁</button>
 <button onclick="copyApiKey()">📋</button>
 </div>
-<p style="color:var(--warn);font-size:.78rem">⚠️ احتفظ به في مكان آمن</p>
+<p style="color:var(--warn);font-size:.75rem">⚠️ احتفظ به بأمان</p>
 </div>
-
 <div class="card">
-<h3>📖 طريقة الاستخدام</h3>
-<div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:14px;font-family:'JetBrains Mono',monospace;font-size:.75rem;direction:ltr;text-align:left;overflow-x:auto;white-space:pre;color:#c9d1e0;margin-top:10px">
-# Remove background
-curl -X POST "YOUR_HOST/api/tool/remove-bg" \\
+<h3>📖 كيفية الاستخدام</h3>
+<div style="background:var(--bg2);border:1px solid var(--border);border-radius:10px;padding:12px;font-family:'JetBrains Mono',monospace;font-size:.7rem;direction:ltr;text-align:left;overflow-x:auto;white-space:pre;color:#c9d1e0;margin-top:8px">
+curl -X POST "YOUR/api/tool/remove-bg" \\
   -H "X-API-Key: YOUR_KEY" \\
   -F "file=@image.jpg" --output result.png
-
-# Enhance
-curl -X POST "YOUR_HOST/api/tool/enhance" \\
-  -H "X-API-Key: YOUR_KEY" \\
-  -F "file=@image.jpg" --output enhanced.jpg
-
-# Info
-curl "YOUR_HOST/api/me" -H "X-API-Key: YOUR_KEY"
-</div>
 </div>
 </div>
 </section>
 
-<!-- ═══ HISTORY ═══ -->
+<!-- HISTORY -->
 <section class="page hidden" id="page-history">
 <h1>📜 سجلي</h1>
 <p class="sub">آخر 50 عملية</p>
-<div class="card" id="history-container"><div class="loading"><div class="spinner"></div><p>جاري التحميل...</p></div></div>
+<div class="card" id="hist-box"><div class="loading"><div class="spinner"></div><p>تحميل...</p></div></div>
 </section>
 
-<!-- ═══ SETTINGS ═══ -->
+<!-- SETTINGS -->
 <section class="page hidden" id="page-settings">
 <h1>⚙️ الإعدادات</h1>
 <p class="sub">تخصيص التطبيق</p>
-<div class="card" style="margin-bottom:12px">
+<div class="card">
 <h3>🎨 المظهر</h3>
-<div class="grid-2" style="margin-top:12px">
+<div class="grid-2" style="margin-top:10px">
 <button class="btn btn-secondary" onclick="setTheme('dark')">🌙 داكن</button>
 <button class="btn btn-secondary" onclick="setTheme('light')">☀️ فاتح</button>
 </div>
 </div>
-<div class="card" style="margin-bottom:12px">
-<h3>🔐 الحساب</h3>
-<p style="color:var(--muted);font-size:.85rem;margin-top:8px">مفتاحك محفوظ في هذا المتصفح. يمكنك مسحه (لن تتمكن من استرجاعه).</p>
-<button class="btn btn-secondary btn-block" style="margin-top:12px" onclick="clearKey()">🗑️ مسح المفتاح من المتصفح</button>
+<div class="card">
+<h3>🔄 المفتاح</h3>
+<p style="color:var(--muted);font-size:.8rem;margin-top:6px">لن تتمكن من استرجاعه بعد المسح</p>
+<button class="btn btn-secondary btn-block" style="margin-top:10px" onclick="regenerateKey()">🔄 توليد مفتاح جديد</button>
 </div>
 <div class="card">
-<h3>📱 التطبيق</h3>
-<p style="color:var(--muted);font-size:.85rem;margin-top:8px">ثبّت التطبيق على شاشتك الرئيسية لتجربة APK كاملة</p>
-<button class="btn btn-primary btn-block" style="margin-top:12px" onclick="doInstall()">📱 تثبيت التطبيق</button>
+<h3>📱 تثبيت التطبيق</h3>
+<button class="btn btn-primary btn-block" style="margin-top:10px" onclick="doInstall()">📱 تثبيت على الجوال</button>
 </div>
 </section>
 
-<!-- ═══ HELP ═══ -->
+<!-- HELP -->
 <section class="page hidden" id="page-help">
 <h1>❓ المساعدة</h1>
 <p class="sub">دليل سريع</p>
-<div class="card" style="margin-bottom:12px">
-<h3>🔑 كيف أحصل على مفتاح؟</h3>
-<p style="color:var(--muted);font-size:.88rem;margin-top:8px">اذهب لصفحة <b>مفاتيح API</b> واضغط زر الإنشاء. المفتاح يظهر مرة واحدة فقط.</p>
-</div>
-<div class="card" style="margin-bottom:12px">
-<h3>💳 ما هي النقاط؟</h3>
-<p style="color:var(--muted);font-size:.88rem;margin-top:8px">كل عملية تستهلك نقطة واحدة. تحصل على 30 نقطة مجانًا. تواصل مع المدير لشحن المزيد.</p>
-</div>
-<div class="card" style="margin-bottom:12px">
-<h3>⚡ لماذا أول عملية إزالة خلفية بطيئة؟</h3>
-<p style="color:var(--muted);font-size:.88rem;margin-top:8px">لأن موديل الذكاء الاصطناعي يُحمَّل مرة واحدة عند أول استخدام. العمليات التالية ستكون سريعة.</p>
-</div>
-<div class="card">
-<h3>🆘 الدعم</h3>
-<p style="color:var(--muted);font-size:.88rem;margin-top:8px">تواصل مع مدير التطبيق عبر لوحة <b>/admin</b></p>
-</div>
+<div class="card"><h3>🔑 المفتاح</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">يتم إنشاؤه تلقائيًا عند أول زيارة. تجده في صفحة API. لا تشاركه مع أحد.</p></div>
+<div class="card"><h3>💳 النقاط</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">كل عملية تستهلك نقطة. اكسب نقاطًا من صفحة <b>المهام</b>.</p></div>
+<div class="card"><h3>⚡ بطء أول عملية</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">موديل إزالة الخلفية يُحمَّل مرة واحدة (30-90ث). بعدها كل شيء سريع.</p></div>
+<div class="card"><h3>🆘 الدعم</h3><p style="color:var(--muted);font-size:.85rem;margin-top:6px">تواصل مع المالك عبر <a href="/owner">/owner</a></p></div>
 </section>
 
 </main>
 
-<!-- ═══ MODALS ═══ -->
-<div class="modal-overlay" id="modal-crop">
-<div class="modal">
-<h3>✂️ قص بنسبة محددة</h3>
-<div class="form-group">
-<label>نسبة العرض:الارتفاع</label>
-<select class="form-input" id="crop-ratio">
-<option value="1:1">1:1 (مربع)</option>
-<option value="4:3">4:3 (شاشة)</option>
-<option value="16:9">16:9 (عريض)</option>
-<option value="9:16">9:16 (ستوري)</option>
-<option value="3:2">3:2 (كاميرا)</option>
-</select>
-</div>
-<div class="modal-actions">
-<button class="btn btn-secondary" onclick="closeModal('modal-crop')">إلغاء</button>
-<button class="btn btn-primary" onclick="doCrop()">تطبيق</button>
-</div>
-</div>
-</div>
+<!-- MODALS -->
+<div class="modal-overlay" id="modal-crop"><div class="modal">
+<h3>✂️ قص بنسبة</h3>
+<div class="form-group"><label>النسبة</label>
+<select class="form-input" id="crop-ratio"><option value="1:1">1:1</option><option value="4:3">4:3</option><option value="16:9">16:9</option><option value="9:16">9:16</option><option value="3:2">3:2</option></select></div>
+<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal('modal-crop')">إلغاء</button><button class="btn btn-primary" onclick="doCrop()">تطبيق</button></div>
+</div></div>
 
-<div class="modal-overlay" id="modal-resize">
-<div class="modal">
-<h3>📐 تحجيم الصورة</h3>
-<div class="grid-2">
-<div class="form-group"><label>العرض (px)</label><input type="number" class="form-input" id="resize-w" placeholder="اترك فارغًا"></div>
-<div class="form-group"><label>الارتفاع (px)</label><input type="number" class="form-input" id="resize-h" placeholder="اترك فارغًا"></div>
-</div>
-<p style="color:var(--muted);font-size:.78rem;margin-bottom:12px">املأ واحدًا على الأقل — سيتم الحفاظ على النسبة</p>
-<div class="modal-actions">
-<button class="btn btn-secondary" onclick="closeModal('modal-resize')">إلغاء</button>
-<button class="btn btn-primary" onclick="doResize()">تطبيق</button>
-</div>
-</div>
-</div>
+<div class="modal-overlay" id="modal-resize"><div class="modal">
+<h3>📐 تحجيم</h3>
+<div class="grid-2"><div class="form-group"><label>عرض (px)</label><input type="number" class="form-input" id="rz-w"></div><div class="form-group"><label>ارتفاع (px)</label><input type="number" class="form-input" id="rz-h"></div></div>
+<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal('modal-resize')">إلغاء</button><button class="btn btn-primary" onclick="doResize()">تطبيق</button></div>
+</div></div>
 
-<div class="modal-overlay" id="modal-watermark">
-<div class="modal">
-<h3>💧 علامة مائية نصية</h3>
+<div class="modal-overlay" id="modal-wm"><div class="modal">
+<h3>💧 علامة مائية</h3>
 <div class="form-group"><label>النص</label><input type="text" class="form-input" id="wm-text" value="Lux Studio"></div>
-<div class="grid-2">
-<div class="form-group">
-<label>الموضع</label>
-<select class="form-input" id="wm-pos">
-<option value="br">أسفل يمين</option>
-<option value="bl">أسفل يسار</option>
-<option value="tr">أعلى يمين</option>
-<option value="tl">أعلى يسار</option>
-<option value="c">الوسط</option>
-</select>
-</div>
-<div class="form-group"><label>الشفافية (%)</label><input type="number" class="form-input" id="wm-opacity" value="60" min="10" max="100"></div>
-</div>
-<div class="modal-actions">
-<button class="btn btn-secondary" onclick="closeModal('modal-watermark')">إلغاء</button>
-<button class="btn btn-primary" onclick="doWatermark()">تطبيق</button>
-</div>
-</div>
-</div>
+<div class="grid-2"><div class="form-group"><label>الموضع</label><select class="form-input" id="wm-pos"><option value="br">أسفل يمين</option><option value="bl">أسفل يسار</option><option value="tr">أعلى يمين</option><option value="tl">أعلى يسار</option><option value="c">وسط</option></select></div><div class="form-group"><label>شفافية</label><input type="number" class="form-input" id="wm-op" value="60" min="10" max="100"></div></div>
+<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal('modal-wm')">إلغاء</button><button class="btn btn-primary" onclick="doWm()">تطبيق</button></div>
+</div></div>
 
-<div class="modal-overlay" id="modal-adjust">
-<div class="modal">
-<h3>🎚️ ضبط الألوان</h3>
-<div class="form-group"><label>السطوع: <span id="adj-b-val">0</span></label><input type="range" id="adj-b" min="-50" max="50" value="0" style="width:100%" oninput="document.getElementById('adj-b-val').textContent=this.value"></div>
-<div class="form-group"><label>التباين: <span id="adj-c-val">0</span></label><input type="range" id="adj-c" min="-50" max="50" value="0" style="width:100%" oninput="document.getElementById('adj-c-val').textContent=this.value"></div>
-<div class="form-group"><label>التشبع: <span id="adj-s-val">0</span></label><input type="range" id="adj-s" min="-50" max="50" value="0" style="width:100%" oninput="document.getElementById('adj-s-val').textContent=this.value"></div>
-<div class="modal-actions">
-<button class="btn btn-secondary" onclick="closeModal('modal-adjust')">إلغاء</button>
-<button class="btn btn-primary" onclick="doAdjust()">تطبيق</button>
-</div>
-</div>
-</div>
+<div class="modal-overlay" id="modal-adjust"><div class="modal">
+<h3>🎚️ ضبط</h3>
+<div class="form-group"><label>سطوع: <span id="adj-bv">0</span></label><input type="range" id="adj-b" min="-50" max="50" value="0" style="width:100%" oninput="document.getElementById('adj-bv').textContent=this.value"></div>
+<div class="form-group"><label>تباين: <span id="adj-cv">0</span></label><input type="range" id="adj-c" min="-50" max="50" value="0" style="width:100%" oninput="document.getElementById('adj-cv').textContent=this.value"></div>
+<div class="form-group"><label>تشبع: <span id="adj-sv">0</span></label><input type="range" id="adj-s" min="-50" max="50" value="0" style="width:100%" oninput="document.getElementById('adj-sv').textContent=this.value"></div>
+<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal('modal-adjust')">إلغاء</button><button class="btn btn-primary" onclick="doAdjust()">تطبيق</button></div>
+</div></div>
 
-<div class="modal-overlay" id="modal-bgcolor">
-<div class="modal">
-<h3>🎨 استبدال الخلفية الشفافة بلون</h3>
-<p style="color:var(--muted);font-size:.85rem;margin-bottom:12px">استخدم بعد إزالة الخلفية</p>
-<div class="form-group"><label>اللون</label><input type="color" class="form-input" id="bgcolor-val" value="#ffffff" style="height:50px;padding:4px"></div>
-<div class="modal-actions">
-<button class="btn btn-secondary" onclick="closeModal('modal-bgcolor')">إلغاء</button>
-<button class="btn btn-primary" onclick="doBgColor()">تطبيق</button>
-</div>
-</div>
-</div>
+<div class="modal-overlay" id="modal-bg"><div class="modal">
+<h3>🎨 خلفية لون</h3>
+<div class="form-group"><label>اللون</label><input type="color" class="form-input" id="bg-color" value="#ffffff" style="height:48px;padding:3px"></div>
+<div class="modal-actions"><button class="btn btn-secondary" onclick="closeModal('modal-bg')">إلغاء</button><button class="btn btn-primary" onclick="doBg()">تطبيق</button></div>
+</div></div>
 
 <div class="toast" id="toast"></div>
 
 <script>
-// ═══ STATE ═══
+// ═══════════ STATE ═══════════
 const state = {
   key: localStorage.getItem('lux_api_key') || null,
   currentPage: 'home',
   currentFile: null,
-  currentSource: null, // 'designer' / 'editor' / 'remove-bg' / 'enhance'
+  currentSource: null,
   theme: localStorage.getItem('lux_theme') || 'dark',
   keyVisible: false,
   deferredPrompt: null,
+  autoKeyTried: false,
+  tasksConfig: null,
 };
 
 const PAGES = {
-  home: {title: 'الرئيسية', sub: 'Lux Studio VIP'},
-  'remove-bg': {title: 'إزالة الخلفية', sub: 'شفافية احترافية'},
-  enhance: {title: 'تحسين الجودة', sub: 'تكبير ×2'},
-  designer: {title: 'أدوات المصمم', sub: '19 أداة'},
-  editor: {title: 'المحرر المتقدم', sub: 'تحكم كامل'},
-  api: {title: 'مفاتيح API', sub: 'اربط خدماتك'},
-  history: {title: 'سجلي', sub: 'العمليات الأخيرة'},
-  settings: {title: 'الإعدادات', sub: 'تخصيص'},
-  help: {title: 'المساعدة', sub: 'دليل سريع'},
+  home:{t:'الرئيسية',s:'Lux Studio VIP'}, 'remove-bg':{t:'إزالة الخلفية',s:'شفافية احترافية'},
+  enhance:{t:'تحسين الجودة',s:'تكبير ×2'}, designer:{t:'أدوات المصمم',s:'19 أداة'},
+  tasks:{t:'المهام والجوائز',s:'اكسب نقاط'}, api:{t:'مفاتيح API',s:'اربط خدماتك'},
+  history:{t:'سجلي',s:'عملياتك'}, settings:{t:'الإعدادات',s:'تخصيص'}, help:{t:'المساعدة',s:'دليل سريع'},
 };
 
-// ═══ NAVIGATION ═══
-function navigate(page) {
-  if (!PAGES[page]) page = 'home';
-  state.currentPage = page;
-  document.querySelectorAll('.page').forEach(p => p.classList.add('hidden'));
-  const target = document.getElementById('page-' + page);
-  if (target) { target.classList.remove('hidden'); }
-  document.querySelectorAll('.nav-item').forEach(el => {
-    el.classList.toggle('active', el.dataset.page === page);
-  });
-  document.getElementById('header-title').textContent = PAGES[page].title;
-  document.getElementById('header-sub').textContent = PAGES[page].sub;
+// ═══════════ NAV ═══════════
+function navigate(page){
+  if(!PAGES[page]) page='home';
+  state.currentPage=page;
+  document.querySelectorAll('.page').forEach(p=>p.classList.add('hidden'));
+  const el=document.getElementById('page-'+page);
+  if(el) el.classList.remove('hidden');
+  document.querySelectorAll('.nav-item').forEach(n=>n.classList.toggle('active',n.dataset.page===page));
+  document.getElementById('h-title').textContent=PAGES[page].t;
+  document.getElementById('h-sub').textContent=PAGES[page].s;
   closeDrawer();
-  window.scrollTo({top:0, behavior:'smooth'});
-  if (page === 'history') loadHistory();
-  if (page === 'api') refreshUser();
-  history.replaceState(null, '', '#/' + page);
+  window.scrollTo({top:0,behavior:'smooth'});
+  if(page==='history') loadHistory();
+  if(page==='tasks') loadTasks();
+  history.replaceState(null,'','#/'+page);
 }
+function openDrawer(){document.getElementById('drawer').classList.add('open');document.getElementById('overlay').classList.add('open')}
+function closeDrawer(){document.getElementById('drawer').classList.remove('open');document.getElementById('overlay').classList.remove('open')}
 
-function openDrawer() {
-  document.getElementById('drawer').classList.add('open');
-  document.getElementById('drawer-overlay').classList.add('open');
-}
-function closeDrawer() {
-  document.getElementById('drawer').classList.remove('open');
-  document.getElementById('drawer-overlay').classList.remove('open');
-}
+// ═══════════ TOAST ═══════════
+function toast(m,t='success'){const el=document.getElementById('toast');el.textContent=m;el.className='toast show '+t;clearTimeout(el._t);el._t=setTimeout(()=>el.className='toast '+t,3500)}
 
-// ═══ TOAST ═══
-function toast(msg, type='success') {
-  const el = document.getElementById('toast');
-  el.textContent = msg;
-  el.className = 'toast show ' + type;
-  clearTimeout(el._t);
-  el._t = setTimeout(() => el.className = 'toast ' + type, 3500);
-}
+// ═══════════ MODALS ═══════════
+function openModal(id){if(!state.currentFile)return toast('❌ اختر صورة أولاً','error');document.getElementById(id).classList.add('show')}
+function closeModal(id){document.getElementById(id).classList.remove('show')}
+document.querySelectorAll('.modal-overlay').forEach(m=>m.addEventListener('click',e=>{if(e.target===m)m.classList.remove('show')}));
 
-// ═══ MODALS ═══
-function openModal(id) { document.getElementById(id).classList.add('show'); }
-function closeModal(id) { document.getElementById(id).classList.remove('show'); }
-document.querySelectorAll('.modal-overlay').forEach(m => {
-  m.addEventListener('click', e => { if (e.target === m) m.classList.remove('show'); });
-});
+// ═══════════ THEME ═══════════
+function setTheme(t){state.theme=t;localStorage.setItem('lux_theme',t);applyTheme();toast(t==='light'?'☀️ فاتح':'🌙 داكن')}
+function applyTheme(){document.body.classList.toggle('light',state.theme==='light')}
 
-// ═══ THEME ═══
-function setTheme(t) {
-  state.theme = t;
-  localStorage.setItem('lux_theme', t);
-  applyTheme();
-  toast(t === 'light' ? '☀️ مظهر فاتح' : '🌙 مظهر داكن');
-}
-function applyTheme() { document.body.classList.toggle('light', state.theme === 'light'); }
-
-// ═══ KEY MANAGEMENT ═══
-async function getFreeKey() {
-  try {
-    const r = await fetch('/api/keys/new', {method: 'POST'});
-    const d = await r.json();
-    if (!r.ok) throw new Error(d.detail || 'فشل');
-    state.key = d.api_key;
-    localStorage.setItem('lux_api_key', d.api_key);
-    toast('✅ تم إنشاء المفتاح');
-    await refreshUser();
-    navigate('home');
-    // Show key in a modal
-    showKeyModal(d.api_key);
-  } catch (e) {
-    toast('❌ ' + e.message, 'error');
+// ═══════════ KEY AUTO-CREATION ═══════════
+async function ensureKey(invite=''){
+  if(state.key) return state.key;
+  try{
+    const url='/api/keys/new'+(invite?'?invite='+encodeURIComponent(invite):'');
+    const r=await fetch(url,{method:'POST'});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.detail||'فشل');
+    state.key=d.api_key;
+    localStorage.setItem('lux_api_key',d.api_key);
+    return state.key;
+  }catch(e){
+    toast('❌ '+e.message,'error');
+    return null;
   }
 }
 
-function showKeyModal(key) {
-  const m = document.createElement('div');
-  m.className = 'modal-overlay show';
-  m.innerHTML = `<div class="modal">
-    <h3>🎉 مفتاحك الجديد</h3>
-    <p style="color:var(--warn);font-size:.85rem;margin-bottom:12px">⚠️ احفظه الآن — لن يظهر مرة أخرى</p>
-    <div class="key-display"><span>${key}</span><button onclick="navigator.clipboard.writeText('${key}');toast('📋 تم النسخ')">📋</button></div>
-    <div class="modal-actions"><button class="btn btn-primary" onclick="this.closest('.modal-overlay').remove()">حفظت المفتاح ✅</button></div>
-  </div>`;
-  document.body.appendChild(m);
-}
-
-function maskKey(k) { return k ? k.slice(0,10) + '••••••' + k.slice(-4) : '-'; }
-function toggleKeyVis() {
-  state.keyVisible = !state.keyVisible;
-  document.getElementById('api-key-masked').textContent = state.keyVisible ? state.key : maskKey(state.key);
-  document.getElementById('btn-toggle-key').textContent = state.keyVisible ? '🙈' : '👁';
-}
-function copyApiKey() {
-  if (state.key) navigator.clipboard.writeText(state.key).then(() => toast('📋 تم النسخ'));
-}
-
-async function refreshUser() {
-  if (!state.key) {
-    document.getElementById('welcome-section').classList.remove('hidden');
-    document.getElementById('dashboard-section').classList.add('hidden');
-    document.getElementById('api-no-key').classList.remove('hidden');
-    document.getElementById('api-with-key').classList.add('hidden');
-    return;
-  }
-  try {
-    const r = await fetch('/api/me', {headers:{'X-API-Key': state.key}});
-    if (r.status === 401) {
-      localStorage.removeItem('lux_api_key');
-      state.key = null;
-      toast('⚠️ مفتاحك غير صالح', 'error');
-      return refreshUser();
+async function refreshUser(){
+  if(!state.key) return;
+  try{
+    const r=await fetch('/api/me',{headers:{'X-API-Key':state.key}});
+    if(r.status===401){
+      localStorage.removeItem('lux_api_key');state.key=null;
+      if(!state.autoKeyTried){state.autoKeyTried=true;await ensureKey();return refreshUser()}
+      return;
     }
-    if (!r.ok) return;
-    const d = await r.json();
-    document.getElementById('welcome-section').classList.add('hidden');
-    document.getElementById('dashboard-section').classList.remove('hidden');
-    document.getElementById('api-no-key').classList.add('hidden');
-    document.getElementById('api-with-key').classList.remove('hidden');
-    document.getElementById('st-credits').textContent = d.credits;
-    document.getElementById('st-ops').textContent = d.total_operations;
-    document.getElementById('st-success').textContent = d.successful;
-    document.getElementById('drawer-credits').textContent = d.credits;
-    document.getElementById('api-key-masked').textContent = state.keyVisible ? state.key : maskKey(state.key);
-  } catch (e) {}
+    if(!r.ok) return;
+    const d=await r.json();
+    document.getElementById('st-credits').textContent=d.credits;
+    document.getElementById('st-ops').textContent=d.total_operations;
+    document.getElementById('st-success').textContent=d.successful;
+    document.getElementById('d-credits').textContent=d.credits;
+    document.getElementById('api-key-masked').textContent=state.keyVisible?state.key:maskKey(state.key);
+  }catch(e){}
 }
 
-function clearKey() {
-  if (!confirm('هل تريد مسح المفتاح؟ لن تتمكن من استرجاعه.')) return;
-  localStorage.removeItem('lux_api_key');
-  state.key = null;
-  toast('🗑️ تم المسح');
-  navigate('home');
-  refreshUser();
+function maskKey(k){return k?k.slice(0,10)+'••••••'+k.slice(-4):'-'}
+function toggleKeyVis(){state.keyVisible=!state.keyVisible;document.getElementById('api-key-masked').textContent=state.keyVisible?state.key:maskKey(state.key);document.getElementById('btn-toggle').textContent=state.keyVisible?'🙈':'👁'}
+function copyApiKey(){if(state.key)navigator.clipboard.writeText(state.key).then(()=>toast('📋 تم النسخ'))}
+async function regenerateKey(){
+  if(!confirm('توليد مفتاح جديد؟ المفتاح القديم سيتوقف.'))return;
+  state.key=null;localStorage.removeItem('lux_api_key');
+  await ensureKey();
+  toast('✅ مفتاح جديد');
+  await refreshUser();
 }
 
-// ═══ FILE PICKING ═══
-function pickFile(source) {
-  state.currentSource = source;
-  document.getElementById('file-' + source).click();
-}
-
-['remove-bg', 'enhance', 'designer', 'editor'].forEach(src => {
-  document.getElementById('file-' + src).addEventListener('change', e => {
-    if (e.target.files.length) handleFile(e.target.files[0], src);
-    e.target.value = '';
+// ═══════════ FILE ═══════════
+function pickFile(src){state.currentSource=src;document.getElementById('file-'+src).click()}
+['remove-bg','enhance','designer'].forEach(src=>{
+  document.getElementById('file-'+src).addEventListener('change',e=>{
+    if(e.target.files.length)handleFile(e.target.files[0],src);
+    e.target.value='';
   });
 });
 
-function handleFile(file, source) {
-  if (!file.type.startsWith('image/')) return toast('❌ ليس صورة', 'error');
-  if (file.size > 15 * 1024 * 1024) return toast('❌ أكبر من 15MB', 'error');
-  state.currentFile = file;
-  state.currentSource = source;
-
-  if (source === 'designer') {
+function handleFile(file,src){
+  if(!file.type.startsWith('image/'))return toast('❌ ليس صورة','error');
+  if(file.size>15*1024*1024)return toast('❌ أكبر من 15MB','error');
+  state.currentFile=file;state.currentSource=src;
+  if(src==='designer'){
     document.getElementById('designer-tools').classList.remove('hidden');
     document.getElementById('result-designer').classList.add('hidden');
     toast('📸 اختر أداة');
-  } else if (source === 'editor') {
-    document.getElementById('editor-tools').classList.remove('hidden');
-    document.getElementById('result-editor').classList.add('hidden');
-    toast('📸 اختر أداة');
-  } else if (source === 'remove-bg') {
-    executeTool('remove-bg', {}, 'result-remove-bg');
-  } else if (source === 'enhance') {
-    executeTool('enhance', {}, 'result-enhance');
+  }else if(src==='remove-bg'){
+    executeTool('remove-bg',{},'result-remove-bg');
+  }else if(src==='enhance'){
+    executeTool('enhance',{},'result-enhance');
   }
 }
 
-// ═══ EXECUTE TOOL ═══
-async function executeTool(toolName, params, resultId) {
-  if (!state.currentFile) return toast('❌ اختر صورة أولاً', 'error');
-  if (!state.key) return toast('❌ مفتاح مفقود — أنشئ واحدًا من صفحة API', 'error');
-
-  const container = document.getElementById(resultId);
+// ═══════════ EXECUTE ═══════════
+async function executeTool(name,params,resultId){
+  if(!state.currentFile)return toast('❌ اختر صورة','error');
+  // ── Auto-create key if missing ──
+  if(!state.key){
+    const k=await ensureKey();
+    if(!k) return toast('❌ تعذر إنشاء المفتاح','error');
+  }
+  const container=document.getElementById(resultId);
   container.classList.remove('hidden');
-  container.innerHTML = `<div class="card"><div class="loading"><div class="spinner"></div><p>⏳ جاري المعالجة...</p></div></div>`;
-
-  const form = new FormData();
-  form.append('file', state.currentFile);
-  const qs = new URLSearchParams(params).toString();
-  const url = '/api/tool/' + toolName + (qs ? '?' + qs : '');
-
-  const t0 = performance.now();
-  try {
-    const r = await fetch(url, {
-      method: 'POST',
-      headers: {'X-API-Key': state.key},
-      body: form,
-    });
-    if (!r.ok) {
-      const err = await r.json().catch(() => ({}));
-      throw new Error(err.detail || `خطأ ${r.status}`);
+  container.innerHTML='<div class="card"><div class="loading"><div class="spinner"></div><p>⏳ جاري المعالجة...</p></div></div>';
+  const form=new FormData();form.append('file',state.currentFile);
+  const qs=new URLSearchParams(params).toString();
+  const url='/api/tool/'+name+(qs?'?'+qs:'');
+  const t0=performance.now();
+  try{
+    const r=await fetch(url,{method:'POST',headers:{'X-API-Key':state.key},body:form});
+    if(!r.ok){
+      const err=await r.json().catch(()=>({}));
+      if(r.status===401){
+        localStorage.removeItem('lux_api_key');state.key=null;
+        const k=await ensureKey();
+        if(k) return executeTool(name,params,resultId);
+      }
+      throw new Error(err.detail||`خطأ ${r.status}`);
     }
-    const blob = await r.blob();
-    const objUrl = URL.createObjectURL(blob);
-    const ext = blob.type === 'image/png' ? 'png' : blob.type === 'image/webp' ? 'webp' : 'jpg';
-    const reader = new FileReader();
-    reader.onload = e => {
-      container.innerHTML = `
+    const blob=await r.blob();
+    const objUrl=URL.createObjectURL(blob);
+    const ext=blob.type==='image/png'?'png':blob.type==='image/webp'?'webp':'jpg';
+    const reader=new FileReader();
+    reader.onload=e=>{
+      container.innerHTML=`
         <div class="preview-row">
           <div class="img-box"><div class="label">الأصلية</div><img src="${e.target.result}" alt=""></div>
-          <div class="img-box"><div class="label">النتيجة</div><div class="${toolName === 'remove-bg' ? 'checker' : ''}"><img src="${objUrl}" alt=""></div></div>
+          <div class="img-box"><div class="label">النتيجة</div><div class="${name==='remove-bg'?'checker':''}"><img src="${objUrl}" alt=""></div></div>
         </div>
-        <div class="grid-2" style="margin-top:12px">
-          <a href="${objUrl}" download="lux_${toolName}.${ext}" class="btn btn-primary">⬇️ تحميل</a>
+        <div class="grid-2">
+          <a href="${objUrl}" download="lux_${name}.${ext}" class="btn btn-primary">⬇️ تحميل</a>
           <button class="btn btn-secondary" onclick="resetPage('${state.currentSource}')">🔄 صورة جديدة</button>
         </div>`;
     };
     reader.readAsDataURL(state.currentFile);
-    toast(`✅ تمت في ${Math.round(performance.now() - t0)}ms`);
+    toast(`✅ ${Math.round(performance.now()-t0)}ms`);
     await refreshUser();
-  } catch (e) {
-    container.innerHTML = `<div class="card"><div style="color:var(--danger);text-align:center;padding:20px">❌ ${e.message}</div></div>`;
-    toast('❌ ' + e.message, 'error');
+  }catch(e){
+    container.innerHTML=`<div class="card"><div style="color:var(--danger);text-align:center;padding:18px">❌ ${e.message}</div></div>`;
+    toast('❌ '+e.message,'error');
   }
 }
 
-function runSimple(toolName, params = {}) {
-  if (!state.currentFile) return toast('❌ اختر صورة', 'error');
-  const resultId = state.currentSource === 'designer' ? 'result-designer' : 'result-editor';
-  executeTool(toolName, params, resultId);
+function runSimple(name,params={}){
+  if(!state.currentFile)return toast('❌ اختر صورة','error');
+  executeTool(name,params,'result-designer');
 }
 
-function resetPage(source) {
-  state.currentFile = null;
-  document.getElementById('file-' + source).value = '';
-  if (source === 'designer') {
-    document.getElementById('designer-tools').classList.add('hidden');
-    document.getElementById('result-designer').classList.add('hidden');
-  } else if (source === 'editor') {
-    document.getElementById('editor-tools').classList.add('hidden');
-    document.getElementById('result-editor').classList.add('hidden');
-  } else if (source === 'remove-bg') {
-    document.getElementById('result-remove-bg').classList.add('hidden');
-  } else if (source === 'enhance') {
-    document.getElementById('result-enhance').classList.add('hidden');
-  }
+function resetPage(src){
+  state.currentFile=null;
+  document.getElementById('file-'+src).value='';
+  if(src==='designer'){document.getElementById('designer-tools').classList.add('hidden');document.getElementById('result-designer').classList.add('hidden')}
+  else if(src==='remove-bg')document.getElementById('result-remove-bg').classList.add('hidden');
+  else if(src==='enhance')document.getElementById('result-enhance').classList.add('hidden');
 }
 
-// ═══ MODAL ACTIONS ═══
-function openCropModal() { if (!state.currentFile) return toast('❌ اختر صورة', 'error'); openModal('modal-crop'); }
-function openResizeModal() { if (!state.currentFile) return toast('❌ اختر صورة', 'error'); openModal('modal-resize'); }
-function openWatermarkModal() { if (!state.currentFile) return toast('❌ اختر صورة', 'error'); openModal('modal-watermark'); }
-function openAdjustModal() { if (!state.currentFile) return toast('❌ اختر صورة', 'error'); openModal('modal-adjust'); }
-function openBgColorModal() { if (!state.currentFile) return toast('❌ اختر صورة', 'error'); openModal('modal-bgcolor'); }
+// ═══════════ MODAL ACTIONS ═══════════
+function doCrop(){const r=document.getElementById('crop-ratio').value;closeModal('modal-crop');runSimple('crop',{ratio:r})}
+function doResize(){const w=document.getElementById('rz-w').value,h=document.getElementById('rz-h').value;if(!w&&!h)return toast('❌ أدخل قيمة','error');closeModal('modal-resize');const p={};if(w)p.width=+w;if(h)p.height=+h;runSimple('resize',p)}
+function doWm(){const t=document.getElementById('wm-text').value||'Lux Studio';const p=document.getElementById('wm-pos').value;const o=+document.getElementById('wm-op').value;closeModal('modal-wm');runSimple('watermark',{text:t,position:p,opacity:o})}
+function doAdjust(){const b=+document.getElementById('adj-b').value,c=+document.getElementById('adj-c').value,s=+document.getElementById('adj-s').value;if(!b&&!c&&!s)return toast('⚠️ لا تغيير','error');closeModal('modal-adjust');runSimple('adjust',{brightness:b,contrast:c,saturation:s})}
+function doBg(){const c=document.getElementById('bg-color').value;closeModal('modal-bg');runSimple('bg-color',{color:c})}
 
-function doCrop() {
-  const ratio = document.getElementById('crop-ratio').value;
-  closeModal('modal-crop');
-  runSimple('crop', {ratio});
-}
-function doResize() {
-  const w = document.getElementById('resize-w').value;
-  const h = document.getElementById('resize-h').value;
-  if (!w && !h) return toast('❌ أدخل عرضًا أو ارتفاعًا', 'error');
-  closeModal('modal-resize');
-  const p = {};
-  if (w) p.width = parseInt(w);
-  if (h) p.height = parseInt(h);
-  runSimple('resize', p);
-}
-function doWatermark() {
-  const text = document.getElementById('wm-text').value || 'Lux Studio';
-  const pos = document.getElementById('wm-pos').value;
-  const opacity = document.getElementById('wm-opacity').value;
-  closeModal('modal-watermark');
-  runSimple('watermark', {text, position: pos, opacity: parseInt(opacity)});
-}
-function doAdjust() {
-  const b = parseInt(document.getElementById('adj-b').value);
-  const c = parseInt(document.getElementById('adj-c').value);
-  const s = parseInt(document.getElementById('adj-s').value);
-  if (b === 0 && c === 0 && s === 0) return toast('⚠️ لا تغيير', 'error');
-  closeModal('modal-adjust');
-  runSimple('adjust', {brightness: b, contrast: c, saturation: s});
-}
-function doBgColor() {
-  const color = document.getElementById('bgcolor-val').value;
-  closeModal('modal-bgcolor');
-  runSimple('bg-color', {color});
+// ═══════════ TASKS ═══════════
+async function loadTasks(){
+  const el=document.getElementById('tasks-list');
+  if(!state.key){const k=await ensureKey();if(!k)return el.innerHTML='<div class="card">تعذر الاتصال</div>'}
+  el.innerHTML='<div class="loading"><div class="spinner"></div><p>تحميل...</p></div>';
+  try{
+    const r=await fetch('/api/tasks',{headers:{'X-API-Key':state.key}});
+    if(!r.ok) throw new Error();
+    const d=await r.json();
+    let html='';
+    // Daily checkin
+    html+=renderTask('daily_checkin',d.daily_checkin,'📅','checkin');
+    // Share
+    html+=renderTask('share_app',d.share_app,'📤','share');
+    // Links
+    d.links.forEach(lk=>{
+      html+=`<div class="task-card ${lk.claimed?'done':''}">
+        <div class="info"><div class="title">${lk.icon||'🔗'} ${lk.title}</div><div class="reward">+${lk.reward} نقطة</div></div>
+        ${lk.claimed?'<span class="badge-claimed">✓ تم</span>':`<a href="${lk.url}" target="_blank" class="btn btn-primary" onclick="setTimeout(()=>claimLink('${lk.id}'),500)">اشترك</a>`}
+      </div>`;
+    });
+    el.innerHTML=html;
+  }catch(e){el.innerHTML='<div class="card" style="color:var(--danger)">فشل التحميل</div>'}
 }
 
-// ═══ HISTORY ═══
-async function loadHistory() {
-  const el = document.getElementById('history-container');
-  if (!state.key) {
-    el.innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted)">لا يوجد مفتاح — أنشئ واحدًا أولاً</div>';
-    return;
-  }
-  el.innerHTML = '<div class="loading"><div class="spinner"></div><p>جاري التحميل...</p></div>';
-  try {
-    const r = await fetch('/api/history', {headers: {'X-API-Key': state.key}});
-    if (!r.ok) throw new Error();
-    const d = await r.json();
-    if (!d.items || !d.items.length) {
-      el.innerHTML = '<div style="text-align:center;padding:30px;color:var(--muted)">لا يوجد سجل بعد</div>';
-      return;
-    }
-    el.innerHTML = d.items.slice(0, 30).map(x => `
+function renderTask(id,cfg,icon,action){
+  return `<div class="task-card ${cfg.claimed?'done':''}">
+    <div class="info"><div class="title">${icon} ${cfg.label||id}</div><div class="reward">+${cfg.reward} نقطة</div></div>
+    ${cfg.claimed?'<span class="badge-claimed">✓ تم</span>':`<button class="btn btn-primary" onclick="claimTask('${action}')">استلام</button>`}
+  </div>`;
+}
+
+async function claimTask(action){
+  if(!state.key)return toast('❌ مفتاح مفقود','error');
+  try{
+    const endpoint=action==='checkin'?'/api/tasks/checkin':action==='share'?'/api/tasks/share':null;
+    if(!endpoint)return;
+    const r=await fetch(endpoint,{method:'POST',headers:{'X-API-Key':state.key}});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.detail||'فشل');
+    toast('🎉 '+d.message);
+    await refreshUser();
+    await loadTasks();
+  }catch(e){toast('❌ '+e.message,'error')}
+}
+
+async function claimLink(linkId){
+  if(!state.key)return;
+  try{
+    const f=new FormData();f.append('link_id',linkId);
+    const r=await fetch('/api/tasks/claim-link',{method:'POST',headers:{'X-API-Key':state.key},body:f});
+    const d=await r.json();
+    if(!r.ok) throw new Error(d.detail||'فشل');
+    toast('🎉 '+d.message);
+    await refreshUser();
+    await loadTasks();
+  }catch(e){/* silent */}
+}
+
+// ═══════════ HISTORY ═══════════
+async function loadHistory(){
+  const el=document.getElementById('hist-box');
+  if(!state.key) return el.innerHTML='<div style="text-align:center;padding:20px;color:var(--muted)">لا يوجد سجل</div>';
+  el.innerHTML='<div class="loading"><div class="spinner"></div><p>تحميل...</p></div>';
+  try{
+    const r=await fetch('/api/history',{headers:{'X-API-Key':state.key}});
+    if(!r.ok) throw new Error();
+    const d=await r.json();
+    if(!d.items||!d.items.length){el.innerHTML='<div style="text-align:center;padding:20px;color:var(--muted)">لا يوجد سجل بعد</div>';return}
+    el.innerHTML=d.items.slice(0,30).map(x=>`
       <div class="history-item">
-        <span class="action">${x.action || '?'}</span>
-        <span style="color:${x.status === 'success' ? 'var(--success)' : 'var(--danger)'}">${x.status === 'success' ? '✅' : '❌'}</span>
-        <span class="time">${(x.created_at || '').slice(0,16).replace('T', ' ')}</span>
+        <span style="font-weight:700">${x.action||'?'}</span>
+        <span style="color:${x.status==='success'?'var(--success)':'var(--danger)'}">${x.status==='success'?'✅':'❌'}</span>
+        <span style="color:var(--muted);font-size:.72rem">${(x.created_at||'').slice(0,16).replace('T',' ')}</span>
       </div>
     `).join('');
-  } catch (e) {
-    el.innerHTML = '<div style="color:var(--danger);text-align:center;padding:20px">فشل التحميل</div>';
-  }
+  }catch(e){el.innerHTML='<div style="color:var(--danger);text-align:center;padding:20px">فشل</div>'}
 }
 
-// ═══ HEALTH ═══
-async function checkHealth() {
-  try {
-    const r = await fetch('/api/health');
-    const d = await r.json();
-    // silent
-  } catch (e) {}
-}
+// ═══════════ PWA ═══════════
+window.addEventListener('beforeinstallprompt',e=>{e.preventDefault();state.deferredPrompt=e;document.getElementById('install-btn').classList.add('show')});
+function doInstall(){if(!state.deferredPrompt)return toast('افتح في Chrome على جوالك','error');state.deferredPrompt.prompt();state.deferredPrompt.userChoice.then(()=>{state.deferredPrompt=null;document.getElementById('install-btn').classList.remove('show')})}
 
-// ═══ PWA INSTALL ═══
-window.addEventListener('beforeinstallprompt', e => {
-  e.preventDefault();
-  state.deferredPrompt = e;
-  document.getElementById('install-btn').classList.add('show');
-});
-function doInstall() {
-  if (!state.deferredPrompt) {
-    toast('افتح الصفحة في Chrome على جوالك', 'error');
-    return;
-  }
-  state.deferredPrompt.prompt();
-  state.deferredPrompt.userChoice.then(() => {
-    state.deferredPrompt = null;
-    document.getElementById('install-btn').classList.remove('show');
-  });
-}
-
-// ═══ INIT ═══
-window.addEventListener('DOMContentLoaded', () => {
+// ═══════════ INIT ═══════════
+window.addEventListener('DOMContentLoaded',async()=>{
   applyTheme();
-  if ('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(() => {});
-  const page = location.hash.replace('#/', '') || 'home';
+  if('serviceWorker' in navigator) navigator.serviceWorker.register('/sw.js').catch(()=>{});
+  // ── AUTO-CREATE KEY ON FIRST VISIT ──
+  if(!state.key){
+    const invite=new URLSearchParams(location.search).get('invite')||'';
+    await ensureKey(invite);
+  }
+  await refreshUser();
+  const page=location.hash.replace('#/','')||'home';
   navigate(page);
-  refreshUser();
-  checkHealth();
-  setInterval(checkHealth, 60000);
+  setInterval(refreshUser,60000);
 });
-
-window.addEventListener('hashchange', () => {
-  const page = location.hash.replace('#/', '') || 'home';
-  if (page !== state.currentPage) navigate(page);
-});
+window.addEventListener('hashchange',()=>{const p=location.hash.replace('#/','')||'home';if(p!==state.currentPage)navigate(p)});
 </script>
 </body>
 </html>"""
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  ADMIN LOGIN HTML
+#  OWNER LOGIN / DASHBOARD HTML
 # ═══════════════════════════════════════════════════════════════════
-ADMIN_LOGIN_HTML = """<!DOCTYPE html>
-<html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin — Lux VIP</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:'Segoe UI',sans-serif;background:#05070f;color:#e8ecf4;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background-image:radial-gradient(circle at 20% 20%,rgba(0,224,255,.12),transparent 40%),radial-gradient(circle at 80% 30%,rgba(124,92,255,.14),transparent 40%)}
-.card{background:rgba(255,255,255,.04);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.08);border-radius:24px;padding:48px 40px;max-width:420px;width:100%;box-shadow:0 30px 80px rgba(0,0,0,.6);text-align:center}
-.icon{font-size:3.5rem;margin-bottom:16px}
-h1{font-size:1.6rem;margin-bottom:8px;background:linear-gradient(135deg,#00e0ff,#7c5cff,#ff2d95);-webkit-background-clip:text;background-clip:text;color:transparent}
-.sub{color:#8a94a8;font-size:.9rem;margin-bottom:32px}
-label{display:block;text-align:right;font-weight:600;margin-bottom:8px;font-size:.85rem;color:#8a94a8}
-input{width:100%;padding:14px 16px;border-radius:12px;border:1px solid rgba(255,255,255,.1);background:#05070f;color:#e8ecf4;font-size:1rem;margin-bottom:20px}
-input:focus{outline:none;border-color:#00e0ff}
-button{width:100%;padding:14px;border:none;border-radius:12px;background:linear-gradient(135deg,#00e0ff,#7c5cff,#ff2d95);color:#05070f;font-weight:800;cursor:pointer;font-size:1rem}
-.back{display:inline-block;margin-top:24px;color:#8a94a8;text-decoration:none;font-size:.85rem}
-</style></head><body>
-<div class="card">
-<div class="icon">👑</div><h1>لوحة المدير</h1><p class="sub">Lux Studio VIP — Admin</p>
-<form method="post" action="/admin/login">
-<label>كلمة المرور</label>
-<input type="password" name="password" required autofocus placeholder="••••••••">
-<button>🔓 دخول</button>
-</form>
-<a href="/" class="back">← العودة للتطبيق</a>
-</div></body></html>"""
+OWNER_LOGIN_HTML = """<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Owner — Lux VIP</title>
+<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',sans-serif;background:#05070f;color:#e8ecf4;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px;background-image:radial-gradient(circle at 20% 20%,rgba(0,224,255,.12),transparent 40%),radial-gradient(circle at 80% 30%,rgba(124,92,255,.14),transparent 40%)}.card{background:rgba(255,255,255,.04);backdrop-filter:blur(20px);border:1px solid rgba(255,255,255,.08);border-radius:24px;padding:44px 36px;max-width:400px;width:100%;text-align:center;box-shadow:0 30px 80px rgba(0,0,0,.6)}.icon{font-size:3.2rem;margin-bottom:14px}h1{font-size:1.5rem;margin-bottom:6px;background:linear-gradient(135deg,#00e0ff,#7c5cff,#ff2d95);-webkit-background-clip:text;background-clip:text;color:transparent}.sub{color:#8a94a8;font-size:.85rem;margin-bottom:26px}label{display:block;text-align:right;font-weight:600;margin-bottom:6px;font-size:.82rem;color:#8a94a8}input{width:100%;padding:13px 15px;border-radius:12px;border:1px solid rgba(255,255,255,.1);background:#05070f;color:#e8ecf4;font-size:1rem;margin-bottom:18px}input:focus{outline:none;border-color:#00e0ff}button{width:100%;padding:13px;border:none;border-radius:12px;background:linear-gradient(135deg,#00e0ff,#7c5cff,#ff2d95);color:#05070f;font-weight:800;cursor:pointer;font-size:.95rem}.back{display:inline-block;margin-top:20px;color:#8a94a8;text-decoration:none;font-size:.82rem}</style>
+</head><body>
+<div class="card"><div class="icon">👑</div><h1>لوحة المالك</h1><p class="sub">Lux Studio VIP — Owner</p>
+<form method="post" action="/owner/login"><label>كلمة المرور</label><input type="password" name="password" required autofocus placeholder="••••••••"><button>🔓 دخول</button></form>
+<a href="/" class="back">← العودة للتطبيق</a></div>
+</body></html>"""
 
 
-# ═══════════════════════════════════════════════════════════════════
-#  ADMIN DASHBOARD HTML
-# ═══════════════════════════════════════════════════════════════════
-ADMIN_DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Admin — Lux VIP</title>
+OWNER_DASHBOARD_HTML = """<!DOCTYPE html><html lang="ar" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Owner — Lux VIP</title>
 <style>
 :root{--bg:#05070f;--bg2:#0a0e1a;--surface:rgba(255,255,255,.04);--border:rgba(255,255,255,.08);--text:#e8ecf4;--muted:#8a94a8;--cyan:#00e0ff;--success:#00ffa3;--danger:#ff4d6d;--grad:linear-gradient(135deg,#00e0ff,#7c5cff,#ff2d95)}
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:'Segoe UI',sans-serif;background:var(--bg);color:var(--text);min-height:100vh}
 body::before{content:'';position:fixed;inset:0;z-index:-1;background:radial-gradient(circle at 15% 20%,rgba(0,224,255,.08),transparent 35%),radial-gradient(circle at 85% 15%,rgba(124,92,255,.10),transparent 35%)}
-header{background:rgba(5,7,15,.85);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:10}
-.logo{font-weight:900;font-size:1.2rem}.logo span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
-.logout{background:rgba(255,77,109,.15);border:1px solid rgba(255,77,109,.3);color:var(--danger);padding:8px 16px;border-radius:8px;cursor:pointer;font-weight:700;font-size:.85rem}
-main{max-width:1200px;margin:0 auto;padding:24px}
-h1{font-size:1.5rem;margin-bottom:20px}
-.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;margin-bottom:24px}
-.stat{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:16px;text-align:center}
-.stat .num{font-size:1.6rem;font-weight:900;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-family:monospace}
-.stat .lbl{color:var(--muted);font-size:.75rem;margin-top:2px}
-.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:20px;overflow-x:auto}
-table{width:100%;border-collapse:collapse;font-size:.82rem;min-width:600px}
-th{text-align:right;padding:10px 8px;color:var(--muted);font-size:.72rem;text-transform:uppercase;border-bottom:1px solid var(--border)}
-td{padding:10px 8px;border-bottom:1px solid rgba(255,255,255,.03)}
-.mono{font-family:monospace;font-size:.75rem;color:var(--cyan)}
-.btn{padding:5px 10px;border:none;border-radius:6px;font-size:.72rem;font-weight:700;cursor:pointer;margin:2px}
+header{background:rgba(5,7,15,.85);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);padding:14px 22px;display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:10;flex-wrap:wrap;gap:8px}
+.logo{font-weight:900;font-size:1.15rem}.logo span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.nav-tabs{display:flex;gap:6px;flex-wrap:wrap}
+.nav-tab{background:transparent;border:1px solid var(--border);color:var(--muted);padding:7px 14px;border-radius:8px;cursor:pointer;font-family:inherit;font-weight:700;font-size:.8rem}
+.nav-tab.active{background:var(--surface);color:var(--cyan);border-color:var(--cyan)}
+.logout{background:rgba(255,77,109,.15);border:1px solid rgba(255,77,109,.3);color:var(--danger);padding:7px 14px;border-radius:8px;cursor:pointer;font-weight:700;font-size:.8rem}
+main{max-width:1200px;margin:0 auto;padding:22px}
+h1{font-size:1.4rem;margin-bottom:18px}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px;margin-bottom:22px}
+.stat{background:var(--surface);border:1px solid var(--border);border-radius:12px;padding:14px;text-align:center}
+.stat .num{font-size:1.5rem;font-weight:900;background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent;font-family:monospace}
+.stat .lbl{color:var(--muted);font-size:.72rem;margin-top:2px}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:14px;padding:18px;overflow-x:auto;margin-bottom:14px}
+table{width:100%;border-collapse:collapse;font-size:.8rem;min-width:600px}
+th{text-align:right;padding:10px 6px;color:var(--muted);font-size:.7rem;text-transform:uppercase;border-bottom:1px solid var(--border)}
+td{padding:10px 6px;border-bottom:1px solid rgba(255,255,255,.03)}
+.mono{font-family:monospace;font-size:.72rem;color:var(--cyan)}
+.btn{padding:5px 10px;border:none;border-radius:6px;font-size:.7rem;font-weight:700;cursor:pointer;margin:1px}
 .btn-add{background:rgba(0,255,163,.15);color:var(--success);border:1px solid rgba(0,255,163,.3)}
 .btn-ban{background:rgba(255,176,32,.15);color:#ffb020;border:1px solid rgba(255,176,32,.3)}
-.toast{position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(150%);background:var(--bg2);border:1px solid var(--border);padding:12px 22px;border-radius:12px;z-index:99;font-weight:600;transition:transform .3s}
+.panel{display:none}.panel.active{display:block}
+.form-group{margin-bottom:12px}
+.form-group label{display:block;margin-bottom:5px;font-weight:600;font-size:.8rem;color:var(--muted)}
+.form-input{width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--border);background:var(--bg2);color:var(--text);font-family:inherit;font-size:.85rem}
+.form-input:focus{outline:none;border-color:var(--cyan)}
+.link-row{display:grid;grid-template-columns:2fr 3fr 1fr 1fr auto;gap:6px;margin-bottom:8px;align-items:center}
+@media(max-width:700px){.link-row{grid-template-columns:1fr;gap:4px;padding:10px;border:1px solid var(--border);border-radius:8px;margin-bottom:10px}}
+.toast{position:fixed;bottom:20px;left:50%;transform:translateX(-50%) translateY(150%);background:var(--bg2);border:1px solid var(--border);padding:12px 20px;border-radius:12px;z-index:99;font-weight:600;font-size:.85rem;transition:transform .3s}
 .toast.show{transform:translateX(-50%) translateY(0)}
 .toast.success{border-color:rgba(0,255,163,.4);color:var(--success)}
 .toast.error{border-color:rgba(255,77,109,.4);color:var(--danger)}
 </style></head><body>
-<header><div class="logo">👑 Lux <span>VIP</span> Admin</div><form method="post" action="/admin/logout" style="margin:0"><button class="logout">🚪 خروج</button></form></header>
-<main>
-<h1>📊 لوحة التحكم</h1>
-<div class="stats" id="stats">
-<div class="stat"><div class="num" id="s-users">-</div><div class="lbl">مستخدم</div></div>
-<div class="stat"><div class="num" id="s-keys">-</div><div class="lbl">مفتاح نشط</div></div>
-<div class="stat"><div class="num" id="s-ops">-</div><div class="lbl">عملية</div></div>
-<div class="stat"><div class="num" id="s-success">-</div><div class="lbl">ناجحة</div></div>
-<div class="stat"><div class="num" id="s-banned">-</div><div class="lbl">محظور</div></div>
-<div class="stat"><div class="num" id="s-credits">-</div><div class="lbl">إجمالي نقاط</div></div>
+<header>
+<div class="logo">👑 Lux <span>VIP</span> Owner</div>
+<div class="nav-tabs">
+<button class="nav-tab active" onclick="tab('stats')">📊 إحصائيات</button>
+<button class="nav-tab" onclick="tab('users')">👥 المستخدمون</button>
+<button class="nav-tab" onclick="tab('tasks')">🎁 المهام</button>
+<button class="nav-tab" onclick="tab('pass')">🔑 كلمة المرور</button>
 </div>
-<div class="card" id="users-table">جاري التحميل...</div>
+<form method="post" action="/owner/logout" style="margin:0"><button class="logout">🚪 خروج</button></form>
+</header>
+<main>
+
+<div class="panel active" id="p-stats">
+<h1>📊 إحصائيات المنصة</h1>
+<div class="stats" id="stats-box"><div class="stat"><div class="num">...</div><div class="lbl">جارٍ التحميل</div></div></div>
+</div>
+
+<div class="panel" id="p-users">
+<h1>👥 المستخدمون</h1>
+<div class="card" id="users-box">جارٍ التحميل...</div>
+</div>
+
+<div class="panel" id="p-tasks">
+<h1>🎁 إعدادات المهام والروابط</h1>
+<div class="card">
+<h3 style="margin-bottom:12px">💎 جوائز المهام</h3>
+<div class="form-group"><label>جائزة الزيارة اليومية</label><input type="number" class="form-input" id="t-daily" value="3"></div>
+<div class="form-group"><label>جائزة المشاركة</label><input type="number" class="form-input" id="t-share" value="5"></div>
+<div class="form-group"><label>جائزة الدعوة</label><input type="number" class="form-input" id="t-invite" value="15"></div>
+</div>
+<div class="card">
+<h3 style="margin-bottom:12px">🔗 روابط الاشتراك</h3>
+<p style="color:var(--muted);font-size:.78rem;margin-bottom:10px">كل رابط يمنح المستخدم النقاط عند الاشتراك</p>
+<div id="links-container"></div>
+<button class="btn btn-add" onclick="addLink()" style="margin-top:10px;padding:8px 16px">+ إضافة رابط</button>
+</div>
+<button class="btn btn-add" onclick="saveConfig()" style="padding:12px 28px;font-size:.9rem;margin-top:10px">💾 حفظ الإعدادات</button>
+</div>
+
+<div class="panel" id="p-pass">
+<h1>🔑 تغيير كلمة المرور</h1>
+<div class="card" style="max-width:500px">
+<div class="form-group"><label>كلمة المرور الحالية</label><input type="password" class="form-input" id="old-pass"></div>
+<div class="form-group"><label>كلمة المرور الجديدة</label><input type="password" class="form-input" id="new-pass"></div>
+<button class="btn btn-add" onclick="changePass()" style="padding:12px 24px;font-size:.85rem;margin-top:8px">💾 حفظ</button>
+</div>
+</div>
+
 </main>
 <div class="toast" id="toast"></div>
 <script>
-function toast(m, t='success'){const e=document.getElementById('toast');e.textContent=m;e.className='toast show '+t;clearTimeout(e._t);e._t=setTimeout(()=>e.className='toast '+t,3000)}
-async function load(){
+function toast(m,t='success'){const el=document.getElementById('toast');el.textContent=m;el.className='toast show '+t;clearTimeout(el._t);el._t=setTimeout(()=>el.className='toast '+t,3000)}
+function tab(name){
+  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
+  document.getElementById('p-'+name).classList.add('active');
+  document.querySelectorAll('.nav-tab').forEach(b=>b.classList.remove('active'));
+  event.target.classList.add('active');
+  if(name==='stats')loadStats();
+  if(name==='users')loadUsers();
+  if(name==='tasks')loadConfig();
+}
+
+async function loadStats(){
   try{
-    const [s,u]=await Promise.all([fetch('/api/admin/stats').then(r=>r.json()),fetch('/api/admin/users').then(r=>r.json())]);
-    document.getElementById('s-users').textContent=s.users;
-    document.getElementById('s-keys').textContent=s.keys_active;
-    document.getElementById('s-ops').textContent=s.operations;
-    document.getElementById('s-success').textContent=s.successful;
-    document.getElementById('s-banned').textContent=s.banned;
-    document.getElementById('s-credits').textContent=s.total_credits;
-    const el=document.getElementById('users-table');
-    if(!u.items.length){el.innerHTML='<div style="text-align:center;padding:20px;color:var(--muted)">لا يوجد مستخدمون</div>';return}
-    el.innerHTML=`<table><thead><tr><th>المعرف</th><th>IP</th><th>النقاط</th><th>الاستخدام</th><th>البادئة</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>${u.items.map(x=>`<tr>
-      <td class="mono">${x.id.slice(0,10)}</td>
-      <td style="color:var(--muted);font-size:.7rem">${x.ip}</td>
-      <td><strong style="color:var(--cyan)">${x.credits}</strong></td>
-      <td>${x.usage_count}</td>
+    const r=await fetch('/api/owner/stats');const d=await r.json();
+    document.getElementById('stats-box').innerHTML=`
+      <div class="stat"><div class="num">${d.users}</div><div class="lbl">مستخدم</div></div>
+      <div class="stat"><div class="num">${d.keys_active}</div><div class="lbl">مفتاح نشط</div></div>
+      <div class="stat"><div class="num">${d.operations}</div><div class="lbl">عملية</div></div>
+      <div class="stat"><div class="num">${d.successful}</div><div class="lbl">ناجحة</div></div>
+      <div class="stat"><div class="num">${d.banned}</div><div class="lbl">محظور</div></div>
+      <div class="stat"><div class="num">${d.total_credits}</div><div class="lbl">إجمالي نقاط</div></div>`;
+  }catch(e){toast('فشل','error')}
+}
+
+async function loadUsers(){
+  try{
+    const r=await fetch('/api/owner/users');const d=await r.json();
+    const el=document.getElementById('users-box');
+    if(!d.items.length){el.innerHTML='<div style="text-align:center;padding:20px;color:var(--muted)">لا مستخدمون</div>';return}
+    el.innerHTML=`<table><thead><tr><th>ID</th><th>IP</th><th>نقاط</th><th>عمليات</th><th>بادئة</th><th>الحالة</th><th>إجراءات</th></tr></thead><tbody>${d.items.map(x=>`<tr>
+      <td class="mono">${x.id.slice(0,10)}</td><td style="color:var(--muted);font-size:.7rem">${x.ip}</td>
+      <td><strong style="color:var(--cyan)">${x.credits}</strong></td><td>${x.usage_count}</td>
       <td class="mono">${x.prefix}</td>
       <td>${x.is_banned?'<span style="color:var(--danger)">محظور</span>':'<span style="color:var(--success)">نشط</span>'}</td>
-      <td>
-        <button class="btn btn-add" onclick="addCredits('${x.id}')">+ نقاط</button>
-        <button class="btn btn-ban" onclick="toggleBan('${x.id}',${!x.is_banned})">${x.is_banned?'فك حظر':'حظر'}</button>
-      </td>
+      <td><button class="btn btn-add" onclick="addCred('${x.id}')">+ نقاط</button><button class="btn btn-ban" onclick="toggleBan('${x.id}',${!x.is_banned})">${x.is_banned?'فك':'حظر'}</button></td>
     </tr>`).join('')}</tbody></table>`;
-  }catch(e){toast('فشل التحميل','error')}
+  }catch(e){toast('فشل','error')}
 }
-async function addCredits(id){
-  const amt=prompt('عدد النقاط (سالب للخصم):');
-  if(!amt)return;
-  const f=new FormData();f.append('user_id',id);f.append('amount',amt);
-  const r=await fetch('/api/admin/user/credits',{method:'POST',body:f});
-  if(r.ok){toast('✅ تم');load()}else toast('❌ فشل','error');
+
+async function addCred(id){const v=prompt('عدد النقاط (سالب للخصم):');if(!v)return;const f=new FormData();f.append('user_id',id);f.append('amount',v);const r=await fetch('/api/owner/user/credits',{method:'POST',body:f});if(r.ok){toast('✅');loadUsers();loadStats()}else toast('❌','error')}
+async function toggleBan(id,b){if(!confirm(b?'حظر؟':'فك؟'))return;const f=new FormData();f.append('user_id',id);f.append('ban',b?'true':'false');const r=await fetch('/api/owner/user/ban',{method:'POST',body:f});if(r.ok){toast('✅');loadUsers()}else toast('❌','error')}
+
+let linksState=[];
+async function loadConfig(){
+  try{
+    const r=await fetch('/api/owner/config');const d=await r.json();
+    document.getElementById('t-daily').value=d.daily_checkin.reward;
+    document.getElementById('t-share').value=d.share_app.reward;
+    document.getElementById('t-invite').value=d.invite_friend.reward;
+    linksState=d.links||[];renderLinks();
+  }catch(e){}
 }
-async function toggleBan(id,ban){
-  if(!confirm(ban?'حظر؟':'فك الحظر؟'))return;
-  const f=new FormData();f.append('user_id',id);f.append('ban',ban?'true':'false');
-  const r=await fetch('/api/admin/user/ban',{method:'POST',body:f});
-  if(r.ok){toast('✅ تم');load()}else toast('❌ فشل','error');
+function renderLinks(){
+  const el=document.getElementById('links-container');
+  if(!linksState.length){el.innerHTML='<p style="color:var(--muted);font-size:.8rem;padding:10px">لا توجد روابط بعد</p>';return}
+  el.innerHTML=linksState.map((lk,i)=>`<div class="link-row">
+    <input class="form-input" value="${lk.icon||''}" onchange="linksState[${i}].icon=this.value" placeholder="إيموجي">
+    <input class="form-input" value="${lk.title||''}" onchange="linksState[${i}].title=this.value" placeholder="العنوان">
+    <input class="form-input" value="${lk.url||''}" onchange="linksState[${i}].url=this.value" placeholder="https://">
+    <input type="number" class="form-input" value="${lk.reward||10}" onchange="linksState[${i}].reward=+this.value" placeholder="نقاط">
+    <button class="btn btn-ban" onclick="linksState.splice(${i},1);renderLinks()">🗑️</button>
+  </div>`).join('');
 }
-load();setInterval(load,30000);
+function addLink(){linksState.push({id:'l'+Date.now(),title:'',url:'',reward:10,icon:'🔗'});renderLinks()}
+async function saveConfig(){
+  const f=new FormData();
+  f.append('daily_reward',document.getElementById('t-daily').value);
+  f.append('share_reward',document.getElementById('t-share').value);
+  f.append('invite_reward',document.getElementById('t-invite').value);
+  f.append('links_json',JSON.stringify(linksState));
+  const r=await fetch('/api/owner/config',{method:'POST',body:f});
+  if(r.ok)toast('✅ تم الحفظ');else toast('❌ فشل','error');
+}
+async function changePass(){
+  const o=document.getElementById('old-pass').value;const n=document.getElementById('new-pass').value;
+  if(!o||!n)return toast('املأ الحقول','error');
+  const f=new FormData();f.append('old_password',o);f.append('new_password',n);
+  const r=await fetch('/api/owner/change-password',{method:'POST',body:f});
+  if(r.ok){toast('✅ تم');document.getElementById('old-pass').value='';document.getElementById('new-pass').value=''}else{const d=await r.json().catch(()=>({}));toast('❌ '+(d.detail||'فشل'),'error')}
+}
+loadStats();
 </script></body></html>"""
 
 
@@ -1814,14 +1739,14 @@ load();setInterval(load,30000);
 # ═══════════════════════════════════════════════════════════════════
 SVG_ICON = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#00e0ff"/><stop offset="0.5" stop-color="#7c5cff"/><stop offset="1" stop-color="#ff2d95"/></linearGradient></defs><rect width="512" height="512" rx="112" fill="#05070f"/><circle cx="256" cy="256" r="140" fill="none" stroke="url(#g)" stroke-width="20"/><path d="M200 320 L256 200 L312 320 Z" fill="url(#g)"/><circle cx="256" cy="180" r="22" fill="url(#g)"/></svg>"""
 
-SW_JS = """self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>self.clients.claim());self.addEventListener('fetch',e=>{if(e.request.method!=='GET')return;if(e.request.url.includes('/api/'))return;if(e.request.url.endsWith('/ping'))return;e.respondWith(caches.open('lux-v6').then(c=>fetch(e.request).then(r=>{if(r.ok&&r.type==='basic')c.put(e.request,r.clone());return r}).catch(()=>c.match(e.request))))});"""
+SW_JS = """self.addEventListener('install',e=>self.skipWaiting());self.addEventListener('activate',e=>self.clients.claim());self.addEventListener('fetch',e=>{if(e.request.method!=='GET')return;if(e.request.url.includes('/api/'))return;if(e.request.url.endsWith('/ping'))return;e.respondWith(caches.open('lux-v7').then(c=>fetch(e.request).then(r=>{if(r.ok&&r.type==='basic')c.put(e.request,r.clone());return r}).catch(()=>c.match(e.request))))});"""
 
 
 # ═══════════════════════════════════════════════════════════════════
 #  RUN
 # ═══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
-    print(f"👑 Lux Studio VIP v6.0 → port {PORT}", flush=True)
+    print(f"👑 Lux Studio VIP v7 → port {PORT}", flush=True)
     print(f"📦 DSS: {DSS_BASE_URL}", flush=True)
-    print(f"🔐 Admin: /admin (password: {ADMIN_PASSWORD})", flush=True)
+    print(f"🔐 Owner: /owner (password: {OWNER_PASSWORD})", flush=True)
     uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info", access_log=False)
