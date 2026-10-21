@@ -1,22 +1,23 @@
 """
 ╔══════════════════════════════════════════════════════════════════╗
-║   🌐 Lux Image Studio — Web App (Single File)                    ║
-║   ملف واحد يحتوي كل شيء: التطبيق + الواجهة + قاعدة البيانات      ║
-║   المفتاح مضمّن داخل الكود — لا ملفات خارجية                      ║
+║   🌐 Lux Image Studio — تطبيق ويب احترافي (ملف واحد)              ║
+║   إزالة خلفية | تحسين | ضغط | تحويل صيغة | تدرج رمادي | API Keys  ║
+║   ملف واحد — مفتاح DSS مضمّن — PWA قابل للتثبيت كتطبيق            ║
+║   نسخة متوافقة مع Render (Python 3.12) + نبضة كل 10 دقائق         ║
 ╚══════════════════════════════════════════════════════════════════╝
 """
 
 # ═══════════════════════════════════════════════════════════════════
-#  القسم 1: الاستيرادات والإعدادات (المفتاح مضمّن هنا)
+#  [1] الاستيرادات
 # ═══════════════════════════════════════════════════════════════════
 import os
 import io
 import time
-import json
 import secrets
 import hashlib
 import logging
 import asyncio
+import contextlib
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -27,29 +28,31 @@ from fastapi.responses import HTMLResponse, Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-# ═══════ المفتاح مضمّن هنا مباشرة ═══════
+# ═══════════════════════════════════════════════════════════════════
+#  [2] الإعدادات (المفتاح مضمّن هنا)
+# ═══════════════════════════════════════════════════════════════════
 DSS_BASE_URL = "https://kali-imvx.onrender.com"
 DSS_API_KEY  = "dss_SSiPIYB4EpWwVmfygQ1LTF2KymOjd-qxAQ4U3Q"
 
 FREE_CREDITS   = 20
 MAX_FILE_MB    = 15
 MAX_FILE_BYTES = MAX_FILE_MB * 1024 * 1024
-PORT           = 8000
+PORT           = int(os.getenv("PORT", "8000"))
 
-# rembg (اختياري — إذا لم يُثبّت، التحسين يبقى شغالاً)
+# rembg (اختياري — إذا فشل، التحسين والضغط يبقيان يعملان)
 try:
     from rembg import remove as rembg_remove
     HAS_REMBG = True
 except Exception as _e:
     HAS_REMBG = False
-    print(f"⚠️ rembg غير متاح ({_e}) — ميزة إزالة الخلفية معطلة، الباقي يعمل.")
+    print(f"⚠️ rembg غير متاح ({_e}) — إزالة الخلفية معطلة، الباقي يعمل.")
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 log = logging.getLogger("lux")
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  القسم 2: عميل قاعدة البيانات DSS
+#  [3] عميل قاعدة البيانات DSS
 # ═══════════════════════════════════════════════════════════════════
 class DSSError(Exception):
     pass
@@ -137,7 +140,7 @@ dss = DSS()
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  القسم 3: المصادقة والمستخدمين والمفاتيح
+#  [4] المصادقة والمستخدمين والمفاتيح
 # ═══════════════════════════════════════════════════════════════════
 def sha256(s: str) -> str:
     return hashlib.sha256(s.encode()).hexdigest()
@@ -164,14 +167,16 @@ async def find_api_key(plain: str) -> Optional[dict]:
 
 
 async def ip_key_count(ip: str) -> int:
-    cutoff = time.time() - 86400  # آخر 24 ساعة
+    cutoff = time.time() - 86400
     count = 0
     try:
         for u in await dss.list("users"):
             if u.get("ip") != ip:
                 continue
             try:
-                ts = datetime.fromisoformat(str(u.get("created_at", "")).replace("Z", "+00:00")).timestamp()
+                ts = datetime.fromisoformat(
+                    str(u.get("created_at", "")).replace("Z", "+00:00")
+                ).timestamp()
                 if ts >= cutoff:
                     count += 1
             except Exception:
@@ -256,7 +261,7 @@ async def authenticate(x_api_key: Optional[str]) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  القسم 4: معالجة الصور
+#  [5] معالجة الصور
 # ═══════════════════════════════════════════════════════════════════
 def _open_image(data: bytes) -> Image.Image:
     try:
@@ -269,7 +274,7 @@ def _open_image(data: bytes) -> Image.Image:
 
 def process_remove_bg(data: bytes) -> bytes:
     if not HAS_REMBG:
-        raise RuntimeError("ميزة إزالة الخلفية غير متوفرة (rembg غير مثبت على الخادم).")
+        raise RuntimeError("ميزة إزالة الخلفية غير متوفرة (rembg غير مثبت).")
     return rembg_remove(data)
 
 
@@ -322,8 +327,7 @@ def process_convert(data: bytes, target: str) -> tuple:
     if target in ("jpg", "jpeg"):
         if img.mode != "RGB":
             img = img.convert("RGB")
-        fmt, mime = "JPEG", "image/jpeg"
-        ext = "jpg"
+        fmt, mime, ext = "JPEG", "image/jpeg", "jpg"
         kwargs = {"quality": 92, "optimize": True}
     elif target == "png":
         if img.mode not in ("RGBA", "RGB"):
@@ -358,9 +362,40 @@ def process_grayscale(data: bytes) -> bytes:
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  القسم 5: تطبيق FastAPI
+#  [6] نبضة داخلية (Self-ping) — تعمل فقط عندما يكون الخادم مستيقظًا
 # ═══════════════════════════════════════════════════════════════════
-app = FastAPI(title="Lux Image Studio", version="2.0.0")
+async def _keep_alive():
+    url = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not url:
+        log.info("ℹ️ RENDER_EXTERNAL_URL غير محدد — self-ping معطل (طبيعي محليًا)")
+        return
+    ping_url = f"{url}/ping"
+    log.info(f"❤️ Self-ping كل 10 دقائق → {ping_url}")
+    while True:
+        await asyncio.sleep(600)
+        try:
+            async with httpx.AsyncClient(timeout=20.0) as c:
+                r = await c.get(ping_url)
+                log.info(f"💓 ping {r.status_code}")
+        except Exception as e:
+            log.warning(f"💔 ping failed: {e}")
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app):
+    task = asyncio.create_task(_keep_alive())
+    try:
+        yield
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  [7] تطبيق FastAPI
+# ═══════════════════════════════════════════════════════════════════
+app = FastAPI(title="Lux Image Studio", version="3.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -369,9 +404,16 @@ app.add_middleware(
 )
 
 
+# ─────────── نقاط ثابتة (لا تلمس قاعدة البيانات) ───────────
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return HTML_PAGE
+
+
+@app.get("/ping")
+async def ping():
+    """نبضة خفيفة جدًا — لا تلمس قاعدة البيانات إطلاقًا."""
+    return {"status": "alive", "ts": time.time()}
 
 
 @app.get("/manifest.json")
@@ -401,6 +443,7 @@ async def service_worker():
     return Response(content=SW_JS, media_type="application/javascript")
 
 
+# ─────────── إدارة المفاتيح ───────────
 @app.post("/api/keys/new")
 async def api_new_key(request: Request):
     ip = request.client.host if request.client else "unknown"
@@ -416,10 +459,7 @@ async def api_new_key(request: Request):
     except Exception as e:
         log.exception("create key failed")
         raise HTTPException(500, f"خطأ: {e}")
-    return {
-        **result,
-        "message": "احفظ هذا المفتاح الآن — لن يظهر مرة أخرى",
-    }
+    return {**result, "message": "احفظ هذا المفتاح الآن — لن يظهر مرة أخرى"}
 
 
 @app.get("/api/me")
@@ -441,6 +481,7 @@ async def api_me(x_api_key: Optional[str] = Header(None)):
     }
 
 
+# ─────────── أدوات مساعدة للصور ───────────
 async def _check_credit(rec: dict):
     user = await get_user_by_id(rec["user_id"])
     if not user:
@@ -458,6 +499,7 @@ async def _read_upload(file: UploadFile) -> bytes:
     return data
 
 
+# ─────────── نقاط معالجة الصور ───────────
 @app.post("/api/remove-bg")
 async def api_remove_bg(
     file: UploadFile = File(...),
@@ -588,7 +630,7 @@ async def api_grayscale(
 
 @app.get("/api/health")
 async def health():
-    result = {"status": "ok", "rembg": HAS_REMBG}
+    result = {"status": "ok", "rembg": HAS_REMBG, "version": "3.0.0"}
     try:
         users = await dss.list("users")
         result["dss"] = "connected"
@@ -600,7 +642,7 @@ async def health():
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  القسم 6: الصفحة (HTML + CSS + JS مضمّنة)
+#  [8] الصفحة (HTML + CSS + JS مضمّنة)
 # ═══════════════════════════════════════════════════════════════════
 HTML_PAGE = """<!DOCTYPE html>
 <html lang="ar" dir="rtl">
@@ -669,9 +711,7 @@ header{
   background:rgba(0,255,163,.15);color:var(--success);
   border:1px solid rgba(0,255,163,.3);
 }
-@media(max-width:500px){
-  .nav a:not(.keep){display:none}
-}
+@media(max-width:500px){ .nav a:not(.keep){display:none} }
 
 main{max-width:1000px;margin:0 auto;padding:24px 16px 60px}
 
@@ -864,9 +904,7 @@ footer{
   </nav>
 </header>
 
-<button class="install-btn" id="install-btn" onclick="doInstall()">
-  📱 تثبيت التطبيق
-</button>
+<button class="install-btn" id="install-btn" onclick="doInstall()">📱 تثبيت التطبيق</button>
 
 <main>
 
@@ -1266,7 +1304,7 @@ function resetStudio() {
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  القسم 7: الأيقونة و Service Worker (لتثبيت PWA)
+#  [9] الأيقونة و Service Worker (لتثبيت PWA)
 # ═══════════════════════════════════════════════════════════════════
 SVG_ICON = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
 <defs>
@@ -1289,6 +1327,7 @@ self.addEventListener('activate', e => self.clients.claim());
 self.addEventListener('fetch', e => {
   if (e.request.method !== 'GET') return;
   if (e.request.url.includes('/api/')) return;
+  if (e.request.url.endsWith('/ping')) return;
   e.respondWith(
     caches.open('lux-v1').then(cache =>
       fetch(e.request).then(res => {
@@ -1302,12 +1341,12 @@ self.addEventListener('fetch', e => {
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  القسم 8: التشغيل
+#  [10] التشغيل
 # ═══════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print("╔══════════════════════════════════════════════════════════╗")
-    print("║  🌐 Lux Image Studio                                    ║")
-    print(f"║  🌍 http://localhost:{PORT}                                ║")
+    print("║  🌐 Lux Image Studio v3.0                                ║")
+    print(f"║  🌍 http://0.0.0.0:{PORT}                                  ║")
     print(f"║  📦 DSS: {DSS_BASE_URL[:42]:<42}  ║")
     print(f"║  🎨 rembg: {'✅' if HAS_REMBG else '❌'}                                       ║")
     print("╚══════════════════════════════════════════════════════════╝")
